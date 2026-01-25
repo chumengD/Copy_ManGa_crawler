@@ -1,5 +1,5 @@
 [package]
-name = "unName"
+name = "Copy_ManGa_downloader"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,3 +10,7 @@ anyhow = "1.0.71"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] } # 序列化核心库
 serde_json = "1.0"
+
+[profile.release]
+lto = true        # 启用链接时优化，体积更小，速度更快
+strip = true      # 自动去除符号表 (显著减小体积)

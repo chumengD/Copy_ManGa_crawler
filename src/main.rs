@@ -6,12 +6,13 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::copy;
+use std::io::{self,copy,Write};
 use std::thread::sleep;
 use std::time::Duration;
 use text_io::read;
 use serde_json::Value;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default)]
 struct Chapter {      //下载图片时依据的结构，len是图片数量，pages_url是每张图片的链接，number是第几章，url是该话的链接
@@ -47,10 +48,31 @@ struct Js_chapters {                 //从控制台获取的章节的名称与�
     len: usize,
 }
 
+fn get_browser_path() -> Option<PathBuf> {
+    // 1. 常见的 Chrome 路径
+    let chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+    for path in &chrome_paths {
+        if PathBuf::from(path).exists() {
+            return Some(PathBuf::from(path));
+        }
+    }
 
+    // 2. 如果没找到 Chrome，尝试 Edge 路径
+    let edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
+    if PathBuf::from(edge_path).exists() {
+        println!("未检测到 Chrome，将使用 Microsoft Edge...");
+        return Some(PathBuf::from(edge_path));
+    }
+
+    None
+}
 
 fn search(client: Client) ->Result<Response, Box<dyn Error>> {
-     print!("输入关键词：");
+     print!("输入关键词：\n");
+     io::stdout().flush()?;
     let key_word: String = read!();
     let base_url = "https://mangacopy.com/api/kb/web/searchcd/comics";
     let params = [
@@ -77,26 +99,19 @@ fn search(client: Client) ->Result<Response, Box<dyn Error>> {
         println!("{}.{}", index, item.name);
     }
     print!("请输入要下载的漫画序号：");
+    
+    io::stdout().flush()?;
     Ok(resp_json)
 
 }
 
 
 
-
-
-
-impl fmt::Display for Chapter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Chapter {} \n{} \n({}) 共{}页",
-            self.number, self.title, self.url, self.len
-        )
-    }
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
+    println!("====这是一个拷贝漫画的漫画下载器====");
+    println!("启动chrome浏览器内核中...");
+    
+
     let mut download_chapters: Vec<Chapter> = Vec::new();
 
     let options = LaunchOptionsBuilder::default()
@@ -120,24 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     //初始化结束
 
 
-    /*print!("请输入关键词：");
-    let key_word: String = read!();
-
     
-
-    tab.navigate_to(&format!("https://mangacopy.com/search?q={key_word}"))?;
-
-    sleep(Duration::from_secs(1));
-    let elements = tab.wait_for_elements(".exemptComic_Item")?;
-
-    for (index, element) in elements.iter().enumerate() {
-        let title = element.find_element(".twoLines")?.get_inner_text()?;
-        println!("{}: {}", index, title);
-    }
-
-    print!("请输入要下载的漫画序号：");
-    let choice: usize = read!();
-*/
 
     let resp_json = search(client.clone())?;
     let choice: i32 = read!();
@@ -153,16 +151,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 等待外层容器出现，确保页面已加载
     tab.wait_for_element("div#default全部")?;
 
-/*    // 修正点 1: 直接使用全局 XPath，不依赖中间变量，避免 "Invalid search result range"
-    // 修正点 2: 你的 HTML 里 a 包裹的是 li，不是 p。所以是 a[li]
-    // 逻辑解释: 找到 id='default全部' 下面的 ul，再找下面所有“包含 li 子元素的 a 标签”
-    let xpath = r#"//div[@id='default全部']//ul//a[li]"#;
-    
-    // 执行查找
-    let chapters = tab.find_elements_by_xpath(xpath)?;
-    let counts = chapters.len();
-
-    println!("该漫画共有{}话", counts);*/
 
     let script = r#"
         (function() {
@@ -201,6 +189,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("该漫画共有{}话", counts);
 
     print!("请输入起始话数(包含该话)：");
+    io::stdout().flush()?;
+
     let start: usize = read!();
     let start:usize =start -1;
     if start >= counts  {
@@ -208,7 +198,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    print!("请输入结束话数（包含该话）：");
+    print!("请输入结束话数(包含该话)：");
+    io::stdout().flush()?;
+
     let end: usize = read!();
     if end > counts || end <= start {
         println!("输入的话数有误");
@@ -284,7 +276,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             let urls = [];
                             images.forEach((img) => {
                                 // 优先 data-src，其次 src
-                                let url = img.getAttribute('data-src') || img.getAttribute('src');
+                                let url = img.getAttribute('data-src');
                                 if (url) urls.push(url);
                             });
                             
@@ -302,83 +294,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         })();
         "#;
 
-
-        // ==========================================
-        //  方案二实现：Rust 端维护状态机进行滚动
-        // ==========================================
-        
-        let mut last_height: u64 = 0;
-        let mut retries = 0;
-        let max_retries = 1; 
-
-        loop {
-            // 1. 执行平滑滚动 (每次滚一屏)
-            // behavior: 'smooth' 配合下面的 sleep 实现拟人化
-            let scroll_cmd = "window.scrollBy({ top: window.innerHeight*14, behavior: 'smooth' });";
-            chapter_tab.evaluate(scroll_cmd, false)?;
-
-            // 2. Rust 等待滚动动画完成 (短等待)
-            // 比如 800 毫秒，给浏览器平滑滚动的时间
-            sleep(Duration::from_millis(50));
-
-            // 3. 检查是否触底 (利用 JS 计算)
-            // 允许 10px 的误差
-            let check_bottom_js = "window.scrollY + window.innerHeight >= document.body.scrollHeight - 10";
-            let is_at_bottom = chapter_tab
-                .evaluate(check_bottom_js, false)?
-                .value.unwrap()
-                .as_bool()
-                .unwrap_or(false);
-
-            // 获取当前高度用于比较
-            let height_js = "document.body.scrollHeight";
-            let current_height = chapter_tab
-                .evaluate(height_js, false)?
-                .value.unwrap()
-                .as_u64() // headless_chrome 返回的是 serde_json::Value
-                .unwrap_or(0);
-
-            if is_at_bottom {
-                println!("    -> 触底检测 ({}/{})...", retries + 1, max_retries);
-                
-                // 4. 触底后的长等待 (给懒加载留时间)
-                sleep(Duration::from_secs(1));
-
-                // 再次获取高度
-                let new_height = chapter_tab
-                    .evaluate(height_js, false)?
-                    .value.unwrap()
-                    .as_u64()
-                    .unwrap_or(0);
-
-                if new_height == last_height {
-                    retries += 1;
-                    if retries >= max_retries {
-                        println!("    ✅ 判定加载完毕");
-                        break; // 真正退出循环
-                    }
-                } else {
-                    println!("    ⬇️ 发现新内容，继续滚动");
-                    retries = 0;
-                    last_height = new_height;
-                }
-            } else {
-                // 还没到底，重置状态，继续滚
-                retries = 0;
-                last_height = current_height;
-            }
-        }
-        // ==========================================
-        //  滚动结束
-        // ==========================================
-
-        let pages = chapter_tab.wait_for_elements("img")?;
-        for page in pages {
-            let page_url = page.get_attribute_value("data-src")?;
-            if let Some(url) = page_url {
-                chapter.pages_url.push(url);
-            }
-        }
+        let Js_pages_url_response = chapter_tab.evaluate(script, true)?;
+            //dbg!(&Js_pages_url_response);
+        let Js_pages_url = Js_pages_url_response.value.unwrap();
+            //dbg!(&Js_pages_url);
+        let urls: Vec<String> = serde_json::from_str(Js_pages_url.as_str().unwrap()).unwrap();
+            //dbg!(&urls);
+       
+        chapter.pages_url = urls;
+            //dbg!(&chapter.pages_url);
         chapter.len = chapter.pages_url.len();
         chapter_tab.close(true)?;
     }
@@ -406,7 +330,7 @@ fn download(chapters: Vec<Chapter>, title: String, client: Client) -> Result<(),
             .send()?;
 
             match copy(&mut response,&mut page){
-                Ok(_) => println!("下载完成：{}:{}/{}", chapter.title, index + 1,page_len),
+                Ok(_) => println!("下载中：{}:{}/{}", chapter.title, index + 1,page_len),
                 Err(e) => println!("下载失败：{}，错误信息：{}", chapter.title, e),
             }   
         }
