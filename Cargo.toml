@@ -1,0 +1,12 @@
+[package]
+name = "unName"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+headless_chrome ="1.0.20"
+text_io = "0.1.13"
+anyhow = "1.0.71"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] } # 序列化核心库
+serde_json = "1.0"
