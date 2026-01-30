@@ -170,12 +170,12 @@ fn search(client: Client) ->Result<Response, Box<dyn Error>> {
      print!("输入关键词：\n");
      let _ = io::stdout().flush();
     let key_word: String = read!();
-    let base_url = "https://mangacopy.com/api/kb/web/searchcd/comics";
+    let base_url = "https://ios.copymanga.club/api/kb/web/searchcd/comics";
     let params = [
         ("offset", "0"),
         ("platform", "2"),
-        ("limit", "10"), // 我改成 10 了，你可以改回 2
-        ("q", &key_word), // 这里 reqwest 会自动把中文转成 %E5%...
+        ("limit", "12"), // 我改成 10 了
+        ("q", &key_word), 
         ("q_type", ""),
     ];
 
@@ -189,7 +189,7 @@ fn search(client: Client) ->Result<Response, Box<dyn Error>> {
 
     //println!("reponse：{:#?}", resp_json);
 
-    println!("以下为搜索结果(仅列举至多10项)：");
+    println!("以下为搜索结果(仅列举至多12项)：");
     let lists = &resp_json.results.list;
     for (index, item) in lists.iter().enumerate() {
         println!("{}.{}", index, item.name);
@@ -481,10 +481,13 @@ let browser = match Browser::new(options) {
 
     download(download_chapters,title,client.clone(),is_jpg)?;
 
-    pause();
+   
 
     kill_zombie_processes();
     clean_old_profiles();
+
+    sleep(Duration::from_secs(180));
+
 
     Ok(())
 }
@@ -562,10 +565,3 @@ fn download(chapters: Vec<Chapter>, title: String, client: Client,is_jpg:char) -
     Ok(())
 }
 
-
-fn pause() {
-    println!("\n程序运行结束，按 Enter 键退出...");
-    io::stdout().flush().unwrap();
-    let mut temp = String::new();
-    io::stdin().read_line(&mut temp).unwrap();
-}
