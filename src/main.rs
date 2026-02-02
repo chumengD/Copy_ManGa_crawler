@@ -17,7 +17,7 @@ use winreg::enums::*;
 use winreg::RegKey;
 use reqwest::header::{HeaderMap, REFERER};
 use std::thread::JoinHandle;
-
+use indicatif::{ProgressBar, ProgressStyle};
 
 use std::process::Command;
 use std::os::windows::process::CommandExt; // 为了隐藏 PowerShell 窗口
@@ -511,7 +511,13 @@ fn download(chapters: Vec<Chapter>, title: String, client: Client,is_jpg:char) -
         fs::create_dir_all(&path)?;
         
 
-    
+        //创建进度条
+        let pb = ProgressBar::new(chapter.len as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}")
+            .unwrap()
+            .progress_chars("█=>"));
+        pb.set_message(format!("下载中: {}", chapter.title));
 
         for (index ,page_url) in chapter.pages_url.iter().enumerate(){
 
@@ -520,21 +526,22 @@ fn download(chapters: Vec<Chapter>, title: String, client: Client,is_jpg:char) -
             let page_len_clone = chapter.pages_url.len().clone();
             let title_clone = title.clone();
             let page_url_clone = page_url.clone();
+            let pb_clone = pb.clone();
 
+            //创建子进程
             let handle = thread::spawn(move|| {
                 let page_path = format!("./download/{}/{}/{}.webp",title_clone, chapter_clone.title, index + 1);
-                let mut page = fs::File::create(&page_path).unwrap();
-
                 let max_retries = 3;
                 
                     for i in 1..=max_retries{
+                        let mut page = fs::File::create(&page_path).unwrap();
                         let response = client_clone.get(&page_url_clone).send();
 
                         match response{
                             Ok(mut res) =>{
                                 match copy(&mut res   ,&mut page){
                                     Ok(_) => {
-                                        println!("下载成功：{}:{}/{}", chapter_clone.title, index + 1,page_len_clone);
+                                       pb_clone.inc(1);
                                         break; // 成功后跳出重试循环
                                     },
                                     Err(e) => {
@@ -576,6 +583,8 @@ fn download(chapters: Vec<Chapter>, title: String, client: Client,is_jpg:char) -
                }
             }
         
+            pb.finish_with_message(format!("{} 下载完毕", chapter.title));
+
         if is_jpg=='y' {
             println!("  [转换中] 正在将本章图片转为 JPG...");
             // 构造 glob 匹配模式，例如 "./download/漫画名/第1话/*.webp"
