@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use std::env;
 use winreg::enums::*;
 use winreg::RegKey;
+use reqwest::header::{HeaderMap, REFERER};
+use std::thread::JoinHandle;
+
 
 use std::process::Command;
 use std::os::windows::process::CommandExt; // 为了隐藏 PowerShell 窗口
@@ -166,11 +169,11 @@ fn get_browser_path_from_registry() -> Option<PathBuf> {
 }
 
 
-fn search(client: Client) ->Result<Response, Box<dyn Error>> {
+fn search(client: Client, base_website: &str) ->Result<Response, Box<dyn Error>> {
      print!("输入关键词：\n");
      let _ = io::stdout().flush();
     let key_word: String = read!();
-    let base_url = "https://ios.copymanga.club/api/kb/web/searchcd/comics";
+    let base_url = format!("{}/api/kb/web/searchcd/comics",&base_website);
     let params = [
         ("offset", "0"),
         ("platform", "2"),
@@ -224,7 +227,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
   
     let mut download_chapters: Vec<Chapter> = Vec::new();
-
+    let base_website = "https://ios.copymanga.club";
 
 
     let mut builder = LaunchOptionsBuilder::default();
@@ -277,9 +280,14 @@ let browser = match Browser::new(options) {
         }
     };
 
+
+    let mut headers = HeaderMap::new();
+    headers.insert(REFERER, base_website.parse().unwrap());
+
     let client = Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
         .danger_accept_invalid_certs(true)
+        .default_headers(headers)
         .build()?;
 
     let tab = browser.new_tab()?;
@@ -288,7 +296,7 @@ let browser = match Browser::new(options) {
 
     
 
-    let resp_json = search(client.clone())?;
+    let resp_json = search(client.clone(),&base_website)?;
     let choice: i32 = read!();
     println!("请稍后...");
     let lists = &resp_json.results.list;
@@ -297,7 +305,7 @@ let browser = match Browser::new(options) {
     let path_word = selected_item.path_word.clone();
   
 
-    let url: String = format!("https://mangacopy.com/comic/{}", &path_word);
+    let url: String = format!("{}/comic/{}",&base_website, &path_word);
     tab.navigate_to(&url)?;
 
     // 等待外层容器出现，确保页面已加载
@@ -498,22 +506,76 @@ fn download(chapters: Vec<Chapter>, title: String, client: Client,is_jpg:char) -
     
     for chapter in chapters {
 
+        let mut handles:Vec<JoinHandle<()>> = Vec::new();
         let path = format!("./download/{}/{}",title, chapter.title);
         fs::create_dir_all(&path)?;
-        let page_len = chapter.pages_url.len();
+        
+
+    
 
         for (index ,page_url) in chapter.pages_url.iter().enumerate(){
-            let page_path = format!("./download/{}/{}/{}.webp",title, chapter.title, index + 1);
-            let mut page = fs::File::create(&page_path)?;
 
-            let mut response = client.get(page_url)
-            .send()?;
+            let client_clone = client.clone();
+            let chapter_clone = chapter.clone();
+            let page_len_clone = chapter.pages_url.len().clone();
+            let title_clone = title.clone();
+            let page_url_clone = page_url.clone();
 
-            match copy(&mut response,&mut page){
-                Ok(_) => println!("下载中：{}:{}/{}", chapter.title, index + 1,page_len),
-                Err(e) => println!("下载失败：{}，错误信息：{}", chapter.title, e),
-            }   
+            let handle = thread::spawn(move|| {
+                let page_path = format!("./download/{}/{}/{}.webp",title_clone, chapter_clone.title, index + 1);
+                let mut page = fs::File::create(&page_path).unwrap();
+
+                let max_retries = 3;
+                
+                    for i in 1..=max_retries{
+                        let response = client_clone.get(&page_url_clone).send();
+
+                        match response{
+                            Ok(mut res) =>{
+                                match copy(&mut res   ,&mut page){
+                                    Ok(_) => {
+                                        println!("下载成功：{}:{}/{}", chapter_clone.title, index + 1,page_len_clone);
+                                        break; // 成功后跳出重试循环
+                                    },
+                                    Err(e) => {
+                                        println!("下载失败：{}第{}页，错误信息：{}", chapter_clone.title, index + 1, e);
+                                        if i <max_retries{
+                                    println!("正在重试第{}次...", i);
+                                }else{
+                                    println!("达到最大重试次数，跳过该页");
+                                    }
+                                    sleep(Duration::from_secs(1));
+                                }
+                            }   
+                        }
+                            Err(e)=>{
+                                println!("发起请求失败：{}第{}页，错误信息：{}", chapter_clone.title, index + 1, e);
+                                if i <max_retries{
+                                    println!("正在重试第{}次...", i);
+                                }else{
+                                    println!("达到最大重试次数，跳过该页");
+                                }
+                                sleep(Duration::from_secs(1));
+                            }
+                    }
+                
+
+              
+                }
+            });
+
+            handles.push(handle);
+
+            
+           
         }
+
+            for handle in handles {
+               if let Err(e) = handle.join(){
+                     println!("线程执行失败: {:?}", e);
+               }
+            }
+        
         if is_jpg=='y' {
             println!("  [转换中] 正在将本章图片转为 JPG...");
             // 构造 glob 匹配模式，例如 "./download/漫画名/第1话/*.webp"
