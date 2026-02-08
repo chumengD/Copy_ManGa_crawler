@@ -540,7 +540,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     //解析章节页面的初始化
     let mut one_tab_count :usize  = 0;
-    let chapter_tab = browser.new_tab()?;
+    let mut chapter_tab = browser.new_tab()?;
 
 //解析章节页面，获取图片链接
     for chapter in &mut download_chapters {
@@ -551,7 +551,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         if one_tab_count >= 20 {
             chapter_tab.close(true)?;
             one_tab_count =0;
-            let chapter_tab = browser.new_tab()?;
+            chapter_tab = browser.new_tab()?;
             chapter_tab.set_default_timeout(std::time::Duration::from_secs(60));
         }
 
@@ -803,6 +803,6 @@ fn download(
     println!("温馨提醒：");
     println!("会有极小概率一话页数没有完整加载出来，导致尾部缺页情况发生，");
     println!("可以根据每话之间的页数对比 or 是否有汉化组尾页来确定是否缺页");
-    println!("重新下载该话能补全页数");
+    println!("重新下载该话能补全页数\n\n");
     Ok(())
 }
