@@ -254,7 +254,6 @@ fn get_browser(client: Client) -> Result<(Browser, bool), Box<dyn Error>> {
     let user_data_path = env::temp_dir().join(&unique_profile_name);
     clean_old_profiles();
 
-    println!("配置独立环境: {:?}", user_data_path);
 
     let mut builder = LaunchOptionsBuilder::default();
 
