@@ -107,7 +107,7 @@ impl fmt::Display for ErrorLog {
     }
 }
 
-fn kill_self_processes() {
+async fn kill_self_processes() {
     // 关键修改：只匹配命名的“前缀”，这样无论后面随机数是多少，都能抓出来
     // 注意：这里要跟你在 main 里面生成的文件夹前缀保持一致
     let target_prefix = "manga_downloader_profile_";
@@ -148,7 +148,7 @@ fn kill_self_processes() {
     }
 }
 
-fn clean_old_profiles() {
+async fn clean_old_profiles() {
     let temp_dir = env::temp_dir();
 
     // 读取 temp 目录下的所有内容
@@ -333,7 +333,8 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
-    clean_old_profiles();
+    kill_self_processes().await;
+    clean_old_profiles().await;
     println!("======这是一个拷贝漫画的漫画下载器======");
     println!("默认保存路径在当前文件夹的download文件夹下\n\n");
     sleep(Duration::from_secs(2)).await;
