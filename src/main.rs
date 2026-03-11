@@ -1,35 +1,49 @@
 #![allow(unused_variables)]
 use anyhow::Result;
-use headless_chrome::{Browser, LaunchOptionsBuilder};
+use chromiumoxide::cdp::browser_protocol::network::StreamResourceContentParamsBuilder;
+use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
+use chromiumoxide::handler;
+use futures::stream::Once;
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use reqwest::header::{HeaderMap, REFERER};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{env ,error::Error ,ffi::OsStr};
-use std::io::{self, Write, copy};
+use std::str::Bytes;
+use std::{env ,error::Error};
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::thread::JoinHandle;
-use std::thread::sleep;
-use std::time::Duration;
-use std::{fs, thread};
+
 use text_io::read;
 use winreg::RegKey;
 use winreg::enums::*;
 use std::fmt;
 
+use std::fs;
+
+//浏览器
+use chromiumoxide::browser::{self, Browser, BrowserConfig, BrowserConfigBuilder};
+use futures::StreamExt;
+use chromiumoxide::Handler;
+use tokio::time::{sleep,Duration,timeout};
+
+
+//下载器相关
+use tokio::io::copy;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Semaphore, SemaphorePermit};
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+
+//注册表相关
 use std::os::windows::process::CommandExt; // 为了隐藏 PowerShell 窗口
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use glob::glob;
-use image::ImageReader;
 
-use std::mem;
-use std::net::TcpStream; // 用于检测端口 // 用于防止主进程杀浏览器
-use std::sync::Arc;
-use std::sync::mpsc;
+//
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Chapter {
@@ -58,6 +72,15 @@ struct Results {
 struct ManGa_item {
     name: String,
     path_word: String,
+    cover:String,
+    author:Vec<Author>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Author{
+    name:String,
+    alias:Option<String>,
+    path_word:String
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -84,7 +107,7 @@ impl fmt::Display for ErrorLog {
     }
 }
 
-fn kill_zombie_processes() {
+fn kill_self_processes() {
     // 关键修改：只匹配命名的“前缀”，这样无论后面随机数是多少，都能抓出来
     // 注意：这里要跟你在 main 里面生成的文件夹前缀保持一致
     let target_prefix = "manga_downloader_profile_";
@@ -198,7 +221,7 @@ fn get_browser_path_from_registry() -> Option<PathBuf> {
     None
 }
 
-fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn Error>> {
+async fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn Error>> {
     print!("输入关键词：\n");
     let _ = io::stdout().flush();
     let key_word: String = read!();
@@ -206,15 +229,18 @@ fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn Error>
     let params = [
         ("offset", "0"),
         ("platform", "2"),
-        ("limit", "12"), // 我改成 10 了
+        ("limit", "12"), 
         ("q", &key_word),
         ("q_type", ""),
     ];
 
-    let response = client.get(base_url).query(&params).send()?;
 
-    let resp_text = response.text()?;
+    let response = client.get(base_url).query(&params).send().await.expect("搜索失败1");
+
+    let resp_text = response.text().await.expect("搜索失败2");
+    //dbg!(&resp_text);
     let resp_json: Response = serde_json::from_str(&resp_text)?;
+    //dbg!(format!("\n\n\n resp_json= {}\n\n\n",&resp_json));
 
     //println!("reponse：{:#?}", resp_json);
 
@@ -228,144 +254,51 @@ fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn Error>
     Ok(resp_json)
 }
 
-fn get_browser(client: Client) -> Result<(Browser, bool), Box<dyn Error>> {
-    let port = 9222;
-    let addr = format!("127.0.0.1:{}", port);
 
-    //检查端口是否开启
-    if TcpStream::connect(&addr).is_ok() {
-        println!(r"检查到运行中的浏览器内核（端口{}），正在接入", port);
-        let CDP = client.get(format!("http://{}/json/version", addr)).send()?;
-        let cdp_json = serde_json::from_str::<Value>(&CDP.text()?)?;
-        let web_socket_debugger_url = cdp_json["webSocketDebuggerUrl"]
-            .as_str()
-            .ok_or("无法获取 webSocketDebuggerUrl")?;
-        dbg!(&web_socket_debugger_url);
-        let browser = Browser::connect(web_socket_debugger_url.to_string())?;
-        return Ok((browser, false)); // false 表示不是“主”，只是接入者
-    }
-
-    kill_zombie_processes();
-    clean_old_profiles();
-
-    println!("未检测到运行中的浏览器内核，正在启动新的浏览器内核...");
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+async fn get_browser(client: Client) -> Result<(Browser,Handler), Box<dyn Error>> {
+    
+    let timestamp = 20260311u128;
     let unique_profile_name = format!("manga_downloader_profile_{}", timestamp);
     let user_data_path = env::temp_dir().join(&unique_profile_name);
-    clean_old_profiles();
 
 
-    let mut builder = LaunchOptionsBuilder::default();
+    let builder:BrowserConfigBuilder = BrowserConfig::builder();
+    let path = get_browser_path_from_registry().unwrap();
+    println!("成功找到浏览器路径:{:?}",path);
+    println!("正在打开浏览器.......");
 
-    match get_browser_path_from_registry() {
-        Some(path) => {
-            println!("已检测到浏览器路径: {:?}", path); // <--- 加上这一句
-            builder.path(Some(path));
-        }
-        None => {
-            println!("警告：未在注册表中找到 Chrome/Edge。");
-            // 如果你不想让它下载，可以在这里直接 return Err(...) 退出
-        }
-    }
 
     let options = builder
-        .headless(true)
-        .window_size(Some((1920, 1080)))
-        .user_data_dir(Some(user_data_path))
-        .args(vec![
-            OsStr::new("--no-sandbox"),
-            OsStr::new("--disable-setuid-sandbox"),
-            OsStr::new("--disable-gpu"),
-            OsStr::new("--disable-software-rasterizer"),
-            OsStr::new("--disable-extensions"),       // 禁用扩展
-            OsStr::new("--disable-infobars"),         // 禁用顶部提示条
-            OsStr::new("--no-first-run"),             // 禁止首次运行向导
-            OsStr::new("--no-default-browser-check"), // 禁止询问是否设为默认浏览器
-            OsStr::new("--disable-infobars"),         // 禁止顶部提示条
-            OsStr::new("--disable-extensions"),       // 禁用扩展，提高速度
-            OsStr::new("--password-store=basic"),     // 禁用系统密码弹窗
-            OsStr::new("--remote-debugging-port=9222"), 
-            OsStr::new("about:blank"),
-            
-        ])
+        .user_data_dir(user_data_path)
+        .launch_timeout(Duration::from_secs(5))
+        .request_timeout(Duration::from_secs(30))
+        .chrome_executable(path)
+        .args([
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",       // 禁用扩展
+            "--disable-infobars",         // 禁用顶部提示条
+            "--no-first-run",             // 禁止首次运行向导
+            "--no-default-browser-check", // 禁止询问是否设为默认浏览器
+            "--disable-infobars",         // 禁止顶部提示条
+            "--disable-extensions",       // 禁用扩展，提高速度
+            "--password-store=basic",     // 禁用系统密码弹窗 
+            "--disable-dev-shm-usage",
+            "about:blank",
+            ])
         .build()?;
 
-    // 带超时的启动检测（简化版）
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let res = Browser::new(options);
-        tx.send(res).unwrap();
-    });
 
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(res) => match res {
-            Ok(b) => Ok((b, true)), // true 表示我是“主”，拥有者
-            Err(e) => {
-                clean_old_profiles(); // 启动失败，核弹清理
-                Err(format!("启动失败: {}", e).into())
-            }
-        },
-        Err(_) => {
-            clean_old_profiles(); // 超时，核弹清理
-            Err("启动超时，已清理进程".into())
-        }
-    }
+        
+       let (browser,mut handler) = Browser::launch(options).await?;
+       println!("成功打开浏览器！");
+       println!("\n\n\n"); 
+
+    Ok((browser,handler))   
 }
 
-fn smart_exit(
-    browser: Browser,
-    is_master: bool,
-) -> Result<(), Box<dyn Error>> {
-    
-
-    let tabs = || -> usize {
-        match browser.get_tabs().lock() {
-            Ok(tabs) => tabs.len(),
-            Err(_) => 0,
-        }
-    };
-
-    let count_now = tabs();
-
-    if count_now > 0 {
-        // 通常 Browser 还会保留一个空白的 Target 页，所以这里可能是 > 1 或 > 0
-        println!("检测到还有其他任务在运行，进入5秒观察期...");
-        sleep(Duration::from_secs(5));
-
-        let count_after = tabs();
-        if count_after > 0 {
-            println!(
-                "5秒后仍有 {} 个 Tab 活动，判定为多窗口运行中。",
-                count_after
-            );
-            if is_master {
-                println!("我是主窗口，但我不能杀进程。正在执行【权限剥离】...");
-                // 【核心黑魔法】
-                // mem::forget 会消耗掉 browser 变量的所有权，但不调用它的 drop()
-                // 这样浏览器进程就会被“遗弃”在后台继续运行，供其他窗口使用
-                mem::forget(browser);
-                println!(">> 内核已保留，本窗口安全退出。");
-            } else {
-                println!(">> 我是从窗口，断开连接退出。");
-            }
-            return Ok(());
-        }
-    }
-
-    // 如果运行到这里，说明没有其他 Tab 了，或者我是最后一个
-    if is_master {
-        println!("没有其他活动窗口，正在彻底关闭浏览器内核...");
-        // 这里不需要做任何事，让 browser 正常离开作用域，就会触发 Drop 自动关闭进程
-    } else {
-        println!("我是从窗口，任务结束。");
-        kill_zombie_processes(); // 主动清理，防止僵尸进程残留
-        // 从窗口无法关闭主进程，只能自己断开。
-        // 如果想要从窗口也能关闭主进程，可以通过 ws 发送 Browser.close 命令，
-        // 但为了安全，建议让主窗口（如果有）或超时机制来处理，或者手动清理。
-    }
-
-    Ok(())
-}
 
 // fn write_chapter(path: &String, chapter: &Chapter) -> Result<(), Box<dyn Error>> {
     
@@ -384,23 +317,26 @@ fn smart_exit(
 //     return Ok(chapter);
 // }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // 真正的逻辑放在 run() 里，main 只负责捕获错误
-    if let Err(e) = run() {
+    if let Err(e) = run().await {
         eprintln!("\n==============================");
         eprintln!("程序发生严重错误，已停止运行：");
         eprintln!("{}", e);
         eprintln!("==============================");
     }
 
+    sleep(Duration::from_secs(180)).await;
     println!("\n按回车键退出...");
     let _ = std::io::stdin().read_line(&mut String::new());
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<(), Box<dyn Error>> {
+    clean_old_profiles();
     println!("======这是一个拷贝漫画的漫画下载器======");
     println!("默认保存路径在当前文件夹的download文件夹下\n\n");
-    sleep(Duration::from_secs(2));
+    sleep(Duration::from_secs(2)).await;
 
     //初始化数据
     let mut download_chapters: Vec<Chapter> = Vec::new();
@@ -416,23 +352,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         .default_headers(headers)
         .build()?;
 
-        
-    //初始化浏览器内核
-    let (browser, is_master) = get_browser(client.clone())?;
 
 
-    sleep(Duration::from_secs(1));
-    let tab = {
-        let tabs = browser.get_tabs().lock().unwrap();
-        tabs.first()
-            .ok_or("未找到初始标签页，请检查浏览器是否正常启动")?
-            .clone()
-    };
-
+    let (mut browser,mut handler) = get_browser(client.clone()).await?;
+   
+    tokio::spawn(async move{
+        while let Some(event) =handler.next().await {}
+    });
     //初始化结束
-    println!("启动内核成功，进入搜索\n");
 
-    let resp_json = search(client.clone(), &base_website)?;
+
+    let resp_json:Response = search(client.clone(), &base_website).await.expect("搜索函数运行失败");
+    //dbg!(&resp_json);
     let choice: i32 = read!();
     println!("请稍后...");
     let lists = &resp_json.results.list;
@@ -441,10 +372,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let path_word = selected_item.path_word.clone();
 
     let url: String = format!("{}/comic/{}", &base_website, &path_word);
-    tab.navigate_to(&url)?;
+
+    //启动浏览器
+
+    let page = browser.new_page(url).await.expect("打开漫画详情页失败");
 
     // 等待外层容器出现，确保页面已加载
-    tab.wait_for_element("div#default全部")?;
+    page.wait_for_navigation().await?;
 
     let script = r#"
         (function() {
@@ -471,10 +405,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         })()
     "#;
 
-    let remote_object = tab.evaluate(script, true)?;
-    //dbg!(&remote_object);
-    let object = remote_object.value.unwrap();
-    //dbg!(&object);
+    let Ok(remote_object) = page.evaluate(script).await else{
+        panic!("获取漫画话数失败!");    
+    };
+
+    //dbg!(&remote_object);;
+    let object = remote_object.value().unwrap();
+    //dbg!("js获取的数据是",&object);
     let json_str = object.as_str().expect("JS返回的不是字符串");
     let js_chapters: Js_chapters = serde_json::from_str(json_str).unwrap();
     //dbg!(&js_chapters);
@@ -495,7 +432,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let start = start - 1;
     if start >= counts {
         println!("输入的话数有误");
-        sleep(Duration::from_secs(3));
+        sleep(Duration::from_secs(3)).await;
         return Ok(());
     }
 
@@ -505,29 +442,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let end: usize = read!();
     if end > counts || end <= start {
         println!("输入的话数有误");
-        sleep(Duration::from_secs(3));
+        sleep(Duration::from_secs(3)).await;
         return Ok(());
     }
 
-    //是否转化图片格式
 
-    let is_jpg: char = 'n';
-    // println!("\n默认图片后缀为.webp");
-    // println!("是否需要将图片转换为jpg?(转换需要花费更长的时间)");
-    // print!("(y/n):");
-    // let is_jpg :char = read!();
-    // let _ = io::stdout().flush();
-    // if is_jpg!='y' && is_jpg!= 'n'{
-    //     println!("输入的字符不是y或n");
-    //     sleep(Duration::from_secs(3));
-    //     return Ok(());
-    // }
 
     //搜集章节信息
     for i in start..end {
         let link = js_chapters.path_words[i].clone();
         let Chapter_title = js_chapters.names[i].clone();
 
+        //获取每一话的url与title
         download_chapters.push(Chapter {
             number: i,
             url: link,
@@ -535,37 +461,29 @@ fn run() -> Result<(), Box<dyn Error>> {
             ..Default::default()
         });
     }
-    tab.close(true)?;
+    page.close();
 
     //解析章节页面的初始化
     let mut one_tab_count :usize  = 0;
-    let mut chapter_tab = browser.new_tab()?;
+    let mut chapter_tab = browser.new_page(&download_chapters[0].url).await.expect("解析第一话时，页面打开失败");
 
-//解析章节页面，获取图片链接
+//解析章节页面，获取一话里的图片链接
     for chapter in &mut download_chapters {
 
         //限制单个tab解析章节数，防止内存泄漏
         //超出20个章节就重开一个tab
         one_tab_count +=1;
         if one_tab_count >= 20 {
-            chapter_tab.close(true)?;
+            chapter_tab.close();
             one_tab_count =0;
-            chapter_tab = browser.new_tab()?;
-            chapter_tab.set_default_timeout(std::time::Duration::from_secs(60));
+            chapter_tab = browser.new_page(&chapter.url).await.expect("解析页面打开失败");
         }
+
+        chapter_tab.goto(&chapter.url).await?;
+        chapter_tab.wait_for_navigation().await?;
 
         println!("正在解析：{}", chapter.title);
 
-
-
-        if let Err(e) = chapter_tab.navigate_to(&chapter.url) {
-            println!("无法进入页面 {}: {}, 跳过", chapter.title, e);
-            error_logs.push(ErrorLog {
-                chapter_title: chapter.title.clone(),
-                error_message: format!("无法进入页面: {}", e),
-            });
-            continue;
-        }
 
          
         let script = r#"(async () => {
@@ -573,7 +491,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 // --- 配置区 (可根据网速调整) ---
                 const scrollStep = 500;   
                 const frequency = 16;    
-                const waitTime = 1000;   
+                const waitTime = 1500;   
                 // ---------------------------
 
                 let totalHeight = 0;
@@ -624,55 +542,85 @@ fn run() -> Result<(), Box<dyn Error>> {
         })();
         "#;
 
-        let Js_pages_url_response = chapter_tab.evaluate(script, true)?;
+        //上诉js代码返回的是该话的每一张图的url的数组
+        
+        let Js_pages_url_response = chapter_tab.evaluate(script).await.expect("解析失败1");
+    
         //dbg!(&Js_pages_url_response);
-        let Js_pages_url = Js_pages_url_response.value.unwrap();
-        //dbg!(&Js_pages_url);
-        let urls: Vec<String> = serde_json::from_str(Js_pages_url.as_str().unwrap()).unwrap();
-        //dbg!(&urls);
+    
+        let Js_pages_url_response = Js_pages_url_response
+        .value()
+        .unwrap()
+        .as_str()
+        .expect("不是String")
+        .to_string();
 
-        chapter.pages_url = urls;
-        //dbg!(&chapter.pages_url);
-        chapter.len = chapter.pages_url.len();
+       // dbg!(&Js_pages_url_response);
+        let Js_pages_url_response:Vec<String> = serde_json::from_str(&Js_pages_url_response).unwrap(); 
+        
+        
+        chapter.pages_url = Js_pages_url_response;
+        chapter.len = chapter.pages_url.len(); 
+        println!("{}.{}共{}页",chapter.number,chapter.title,chapter.len);
 
-        // //创建相应日志文件保存获取的图片链接，而不是一直保存在内存里
-        // let path = format!("./download/log/{}/{}.json", title, chapter.title);
-        // if let Err(e) = write_chapter(&path,&chapter){
-        //     println!("无法写入章节日志 {}: {}, 跳过", chapter.title, e);
-        //     error_logs.push(ErrorLog {
-        //         chapter_title: chapter.title.clone(),
-        //         error_message: format!("无法写入章节日志: {}", e),
-        //     });
-        //     continue;
-        // }
+// match Js_pages_url_response {
+//     Some(val) => {
+//         if let Some(json_str) = val.as_str() {
+//             match serde_json::from_str::<Vec<String>>(json_str) {
+//                 Ok(urls) => {
+//                     chapter.pages_url = urls;
+//                     chapter.len = chapter.pages_url.len();
+//                     println!("{} 共 {} 页", chapter.title, chapter.len);
+//                 }
+//                 Err(e) => {
+//                     println!("解析JSON失败: {}，跳过本章", e);
+//                     // 记录错误日志...
+//                     continue; 
+//                 }
+//             }
+//         } else {
+//              println!("JS返回的数据不是字符串，跳过本章");
+//              continue;
+//         }
+//     },
+//     None => {
+//         println!("页面加载超时或JS执行未返回数据，跳过本章: {}", chapter.title);
+//         // 这里可以选择重试逻辑，而不是直接让程序崩溃
+//         continue;
+//     }
+// }
 
-        println!("{}共{}页", chapter.title, chapter.len);
     }
 
-    chapter_tab.close(true)?;
+    chapter_tab.close();
+    browser.close().await?;
 
-    download(download_chapters, title, client.clone(), is_jpg)?;
+    clean_old_profiles();
 
-    smart_exit(browser, is_master)?;
+    new_download(download_chapters, title, client.clone()).await;
 
+    
+   
     //打印错误日志
     for log in error_logs {
         println!("错误章节记录：{}", log);
     }
 
-    sleep(Duration::from_secs(180));
-
     Ok(())
 }
 
-fn download(
+async fn download(
     chapters: Vec<Chapter>,
     title: String,
     client: Client,
-    is_jpg: char,
 ) -> Result<(), Box<dyn Error>> {
+       //为多线程下载做准备，限制线程数量
+        let once_max_dowload = Arc::new(Semaphore::new(64));
+
     for chapter in chapters {
-        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        //创建漫画文件夹
         let path = format!("./download/{}/{}", title, chapter.title);
         fs::create_dir_all(&path)?;
 
@@ -683,6 +631,9 @@ fn download(
             .unwrap()
             .progress_chars("█=>"));
         pb.set_message(format!("下载中: {}", chapter.title));
+        //创建进度条
+
+ 
 
         for (index, page_url) in chapter.pages_url.iter().enumerate() {
             let client_clone = client.clone();
@@ -690,10 +641,14 @@ fn download(
             let page_len_clone = chapter.pages_url.len().clone();
             let title_clone = title.clone();
             let page_url_clone = page_url.clone();
-            let pb_clone = pb.clone();
+            let pb_clone = pb.clone();                                
 
-            //创建子进程
-            let handle = thread::spawn(move || {
+            let once_max_download_clone = once_max_dowload.clone();
+
+        //创建子进程
+        let handle = tokio::spawn(async move{
+                let aquire = once_max_download_clone.acquire_owned().await.unwrap();
+
                 let page_path = format!(
                     "./download/{}/{}/{}.webp",
                     title_clone,
@@ -702,106 +657,193 @@ fn download(
                 );
                 let max_retries = 3;
 
+                //在开始下载前创建相应图片文件
+                let mut page = tokio::fs::File::create(&page_path).await.unwrap();
                 for i in 1..=max_retries {
-                    let mut page = fs::File::create(&page_path).unwrap();
-                    let response = client_clone.get(&page_url_clone).send();
+
+
+                    //发送网络请求
+                    let response = client_clone.
+                    get(&page_url_clone)
+                    .send()
+                    .await;
 
                     match response {
                         Ok(mut res) => {
-                            match copy(&mut res, &mut page) {
-                                Ok(_) => {
-                                    pb_clone.inc(1);
-                                    break; // 成功后跳出重试循环
-                                }
-                                Err(e) => {
-                                    println!(
-                                        "下载失败：{}第{}页，错误信息：{}",
-                                        chapter_clone.title,
-                                        index + 1,
-                                        e
-                                    );
-                                    if i < max_retries {
-                                        println!("正在重试第{}次...", i);
-                                    } else {
-                                        println!("达到最大重试次数，跳过该页");
+                            let mut bytes = res.bytes_stream();
+
+                        //流下载    
+                        while let Some(chunk) = bytes.next().await {
+                                match chunk {
+                                    Ok(chunk) => {
+                                        page.write_all(&chunk).await.unwrap();
+                                        
                                     }
-                                    sleep(Duration::from_secs(1));
+                                    Err(e) => {
+                                        println!("下载出错: {}", e);
+                                        println!("正在重试第{}次",i);
+                                        break;
+                                    }
                                 }
+                            } 
+                        pb_clone.inc(1);
+                        break;
                             }
-                        }
+
+
                         Err(e) => {
                             println!(
-                                "发起请求失败：{}第{}页，错误信息：{}",
+                                "发起请求失败：{}第{}页",
                                 chapter_clone.title,
                                 index + 1,
-                                e
+                                
                             );
                             if i < max_retries {
                                 println!("正在重试第{}次...", i);
                             } else {
                                 println!("达到最大重试次数，跳过该页");
                             }
-                            sleep(Duration::from_secs(1));
+                            sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
+                
             });
 
             handles.push(handle);
         }
 
         for handle in handles {
-            if let Err(e) = handle.join() {
-                println!("线程执行失败: {:?}", e);
+             let _ = handle.await;
             }
-        }
 
         pb.finish_with_message(format!("{} 下载完毕", chapter.title));
-
-        if is_jpg == 'y' {
-            println!("  [转换中] 正在将本章图片转为 JPG...");
-
-            // 注意：变量 `path` 是你在上面定义的文件夹路径
-            let pattern = format!("{}/{}", path, "*.webp");
-
-            // 使用 glob 遍历文件夹下的 webp 文件
-            for entry in glob(&pattern)? {
-                match entry {
-                    Ok(file_path) => {
-                        // 1. 打开并解码 WebP 图片
-                        // 参考文档: https://docs.rs/image/0.25.9/image/io/struct.Reader.html#method.open
-                        match ImageReader::open(&file_path) {
-                            Ok(reader) => match reader.decode() {
-                                Ok(img) => {
-                                    // 2. 修改后缀名为 jpg
-                                    let jpg_path = file_path.with_extension("jpg");
-
-                                    if let Err(e) = img.save(&jpg_path) {
-                                        eprintln!("    保存 JPG 失败: {:?} -> {}", file_path, e);
-                                    } else {
-                                        fs::remove_file(&file_path)?;
-
-                                        // 打印进度点，避免刷屏
-                                        print!(".");
-                                        let _ = io::stdout().flush();
-                                    }
-                                }
-                                Err(e) => eprintln!("    图片解码失败: {:?} -> {}", file_path, e),
-                            },
-                            Err(e) => eprintln!("    无法打开文件: {:?} -> {}", file_path, e),
-                        }
-                    }
-                    Err(e) => eprintln!("    Glob 路径错误: {:?}", e),
-                }
-            }
-            println!("\n  [完成] 本章转换结束");
+    
         }
-    }
-
+    
+       
     println!("\n所有章节下载完成！");
     println!("温馨提醒：");
     println!("会有极小概率一话页数没有完整加载出来，导致尾部缺页情况发生，");
     println!("可以根据每话之间的页数对比 or 是否有汉化组尾页来确定是否缺页");
     println!("重新下载该话能补全页数\n\n");
     Ok(())
-}
+    }
+
+async fn new_download(
+    chapters: Vec<Chapter>,
+    title: String,
+    client: Client,
+) -> Result<(), Box<dyn Error>> {
+       //为多线程下载做准备，限制线程数量
+        let once_max_dowload = Arc::new(Semaphore::new(64));
+
+    for chapter in chapters {
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        //创建漫画文件夹
+        let path = format!("./download/{}/{}", title, chapter.title);
+        fs::create_dir_all(&path)?;
+
+        //创建进度条
+        let pb = ProgressBar::new(chapter.len as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}")
+            .unwrap()
+            .progress_chars("█=>"));
+        pb.set_message(format!("下载中: {}", chapter.title));
+        //创建进度条
+
+ 
+
+        for (index, page_url) in chapter.pages_url.iter().enumerate() {
+            let client_clone = client.clone();
+            let chapter_clone = chapter.clone();
+            let page_len_clone = chapter.pages_url.len().clone();
+            let title_clone = title.clone();
+            let page_url_clone = page_url.clone();
+            let pb_clone = pb.clone();                                
+
+            let once_max_download_clone = once_max_dowload.clone();
+
+        //创建子进程
+        let handle = tokio::spawn(async move{
+                let aquire = once_max_download_clone.acquire_owned().await.unwrap();
+
+                let page_path = format!(
+                    "./download/{}/{}/{}.webp",
+                    title_clone,
+                    chapter_clone.title,
+                    index + 1
+                );
+                let limit = Duration::from_secs(60);
+
+
+                //在开始下载前创建相应图片文件
+                let timeout_result = timeout(limit, async {             
+                        
+                    let mut isErr :bool = false;
+                    loop{
+
+                        let mut page = tokio::fs::File::create(&page_path).await.unwrap();
+
+                        //发送网络请求
+                        let response = client_clone.
+                        get(&page_url_clone)
+                        .send()
+                        .await;
+
+                        match response {
+                            Ok(res) =>{
+
+                                let mut steam = res.bytes_stream();
+
+                                    while let Some(chunk) = steam.next().await{
+                                        if let Ok(chunk) = chunk{
+                                            page.write_all(&chunk).await.unwrap();
+                                        }
+                                    }
+                                    
+                                    if isErr {
+                                        println!("{}:第{}页下载重试完成，下载成功！",chapter_clone.title,index+1);
+                                    }
+                                    pb_clone.inc(1);
+                                    break;
+                            }
+                            Err(_) =>{
+                                if !isErr {
+                                    println!("{}:第{}页下载失败，正在重试...",chapter_clone.title,index+1);
+                                    isErr = true;
+                                }
+                            }
+                        }
+                        
+                    } 
+               })
+                .await
+                .expect("超过重试时长(60s)，跳过下载该页");
+                    
+    
+                    }   
+            );
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+             let _ = handle.await;
+            }
+
+        pb.finish_with_message(format!("{} 下载完毕", chapter.title));
+    
+        }
+    
+       
+    println!("\n所有章节下载完成！");
+    println!("温馨提醒：");
+    println!("会有极小概率一话页数没有完整加载出来，导致尾部缺页情况发生，");
+    println!("可以根据每话之间的页数对比 or 是否有汉化组尾页来确定是否缺页");
+    println!("重新下载该话能补全页数\n\n");
+    Ok(())
+    }
+
