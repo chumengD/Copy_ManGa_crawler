@@ -225,7 +225,7 @@ async fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn 
     print!("输入关键词：\n");
     let _ = io::stdout().flush();
     let key_word: String = read!();
-    let base_url = format!("{}/api/kb/web/searchcd/comics", &base_website);
+    let base_url = format!("{}/api/kb/web/searchci/comics", &base_website);
     let params = [
         ("offset", "0"),
         ("platform", "2"),
@@ -236,13 +236,15 @@ async fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn 
 
 
     let response = client.get(base_url).query(&params).send().await.expect("搜索失败1");
+    let response1 = client.get("https://ios.copymanga.club/search?q=1&q_type=").send().await.expect("搜索失败1");
+    //dbg!(&response);
 
     let resp_text = response.text().await.expect("搜索失败2");
     //dbg!(&resp_text);
     let resp_json: Response = serde_json::from_str(&resp_text)?;
     //dbg!(format!("\n\n\n resp_json= {}\n\n\n",&resp_json));
 
-    //println!("reponse：{:#?}", resp_json);
+    println!("reponse：{:#?}", resp_json);
 
     println!("以下为搜索结果(仅列举至多12项)：");
     let lists = &resp_json.results.list;
@@ -374,12 +376,29 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let url: String = format!("{}/comic/{}", &base_website, &path_word);
 
-    //启动浏览器
 
     let page = browser.new_page(url).await.expect("打开漫画详情页失败");
 
     // 等待外层容器出现，确保页面已加载
-    page.wait_for_navigation().await?;
+   let mut wait_count = 0;
+let max_retries = 20;
+
+while (wait_count < max_retries) {
+    // 尝试寻找该元素
+    if page.find_element("#default全部").await.is_ok() {
+        println!("目标容器 #default全部 已挂载到 DOM！");
+        break;
+    }
+    
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_count += 1;
+}
+
+    if wait_count >= max_retries {
+        panic!("超时未找到漫画列表容器，可能是网页结构改变或网络延迟过高");
+    }
+
+    println!("成功进入网页");
 
     let script = r#"
         (function() {
@@ -415,7 +434,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     //dbg!("js获取的数据是",&object);
     let json_str = object.as_str().expect("JS返回的不是字符串");
     let js_chapters: Js_chapters = serde_json::from_str(json_str).unwrap();
-    //dbg!(&js_chapters);
+    // dbg!(&js_chapters);
     let counts = js_chapters.len;
     let names = &js_chapters.names;
 
@@ -461,6 +480,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             title: Chapter_title,
             ..Default::default()
         });
+        // dbg!(&download_chapters);
     }
     page.close();
 
