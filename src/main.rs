@@ -108,7 +108,7 @@ impl fmt::Display for ErrorLog {
 }
 
 async fn kill_self_processes() {
-    // 关键修改：只匹配命名的“前缀”，这样无论后面随机数是多少，都能抓出来
+    // 关键修改：只匹配命名的"前缀"，这样无论后面随机数是多少，都能抓出来
     // 注意：这里要跟你在 main 里面生成的文件夹前缀保持一致
     let target_prefix = "manga_downloader_profile_";
 
@@ -302,23 +302,6 @@ async fn get_browser(client: Client) -> Result<(Browser,Handler), Box<dyn Error>
 }
 
 
-// fn write_chapter(path: &String, chapter: &Chapter) -> Result<(), Box<dyn Error>> {
-    
-//     let file = fs::File::create(path)?;
-//     let writer = io::BufWriter::new(file);
-//     serde_json::to_writer_pretty(writer, &chapter)?;
-
-//     return Ok(());
-// }
-
-// fn read_chapter(path:&String)-> Result<Chapter, Box<dyn Error>> {
-    
-//     let file = fs::File::open(path)?;
-//     let reader = io::BufReader::new(file);
-//     let chapter = serde_json::from_reader(reader)?;
-//     return Ok(chapter);
-// }
-
 #[tokio::main]
 async fn main() {
     // 真正的逻辑放在 run() 里，main 只负责捕获错误
@@ -466,38 +449,39 @@ while (wait_count < max_retries) {
         return Ok(());
     }
 
-
-
-    //搜集章节信息
+    // 先收集需要下载的章节基本信息（url 和 title）
     for i in start..end {
         let link = js_chapters.path_words[i].clone();
-        let Chapter_title = js_chapters.names[i].clone();
-
-        //获取每一话的url与title
+        let chapter_title = js_chapters.names[i].clone();
         download_chapters.push(Chapter {
             number: i,
             url: link,
-            title: Chapter_title,
+            title: chapter_title,
             ..Default::default()
         });
-        // dbg!(&download_chapters);
     }
+
     page.close();
 
-    //解析章节页面的初始化
-    let mut one_tab_count :usize  = 0;
-    let mut chapter_tab = browser.new_page(&download_chapters[0].url).await.expect("解析第一话时，页面打开失败");
+    // 解析章节页面的初始化
+    let mut one_tab_count: usize = 0;
+    let mut chapter_tab = browser
+        .new_page(&download_chapters[0].url)
+        .await
+        .expect("解析第一话时，页面打开失败");
 
-//解析章节页面，获取一话里的图片链接
+    // ===== 核心改动：解析一章，立即下载一章 =====
     for chapter in &mut download_chapters {
 
-        //限制单个tab解析章节数，防止内存泄漏
-        //超出20个章节就重开一个tab
-        one_tab_count +=1;
+        // 限制单个 tab 解析章节数，防止内存泄漏
+        one_tab_count += 1;
         if one_tab_count >= 20 {
             chapter_tab.close();
-            one_tab_count =0;
-            chapter_tab = browser.new_page(&chapter.url).await.expect("解析页面打开失败");
+            one_tab_count = 0;
+            chapter_tab = browser
+                .new_page(&chapter.url)
+                .await
+                .expect("解析页面打开失败");
         }
 
         chapter_tab.goto(&chapter.url).await?;
@@ -505,8 +489,6 @@ while (wait_count < max_retries) {
 
         println!("正在解析：{}", chapter.title);
 
-
-         
         let script = r#"(async () => {
             return await new Promise((resolve) => {
                 // --- 配置区 (可根据网速调整) ---
@@ -563,69 +545,40 @@ while (wait_count < max_retries) {
         })();
         "#;
 
-        //上诉js代码返回的是该话的每一张图的url的数组
-        
-        let Js_pages_url_response = chapter_tab.evaluate(script).await.expect("解析失败1");
-    
-        //dbg!(&Js_pages_url_response);
-    
-        let Js_pages_url_response = Js_pages_url_response
-        .value()
-        .unwrap()
-        .as_str()
-        .expect("不是String")
-        .to_string();
+        let js_pages_url_response = chapter_tab.evaluate(script).await.expect("解析失败1");
 
-       // dbg!(&Js_pages_url_response);
-        let Js_pages_url_response:Vec<String> = serde_json::from_str(&Js_pages_url_response).unwrap(); 
-        
-        
-        chapter.pages_url = Js_pages_url_response;
-        chapter.len = chapter.pages_url.len(); 
-        println!("{}.{}共{}页",chapter.number,chapter.title,chapter.len);
+        let js_pages_url_response = js_pages_url_response
+            .value()
+            .unwrap()
+            .as_str()
+            .expect("不是String")
+            .to_string();
 
-// match Js_pages_url_response {
-//     Some(val) => {
-//         if let Some(json_str) = val.as_str() {
-//             match serde_json::from_str::<Vec<String>>(json_str) {
-//                 Ok(urls) => {
-//                     chapter.pages_url = urls;
-//                     chapter.len = chapter.pages_url.len();
-//                     println!("{} 共 {} 页", chapter.title, chapter.len);
-//                 }
-//                 Err(e) => {
-//                     println!("解析JSON失败: {}，跳过本章", e);
-//                     // 记录错误日志...
-//                     continue; 
-//                 }
-//             }
-//         } else {
-//              println!("JS返回的数据不是字符串，跳过本章");
-//              continue;
-//         }
-//     },
-//     None => {
-//         println!("页面加载超时或JS执行未返回数据，跳过本章: {}", chapter.title);
-//         // 这里可以选择重试逻辑，而不是直接让程序崩溃
-//         continue;
-//     }
-// }
+        let js_pages_url_response: Vec<String> =
+            serde_json::from_str(&js_pages_url_response).unwrap();
 
+        chapter.pages_url = js_pages_url_response;
+        chapter.len = chapter.pages_url.len();
+        println!(
+            "{}.{} 共 {} 页，解析完毕，立即开始下载...",
+            chapter.number, chapter.title, chapter.len
+        );
+
+        // ===== 解析完一章后，立即下载该章 =====
+        new_download(vec![chapter.clone()], title.clone(), client.clone()).await?;
     }
 
     chapter_tab.close();
     browser.close().await?;
 
-    clean_old_profiles();
+    clean_old_profiles().await;
 
-    new_download(download_chapters, title, client.clone()).await;
-
-    
-   
-    //打印错误日志
+    // 打印错误日志
     for log in error_logs {
         println!("错误章节记录：{}", log);
     }
+
+    println!("\n全部章节解析并下载完成！");
 
     Ok(())
 }
@@ -867,4 +820,3 @@ async fn new_download(
     println!("重新下载该话能补全页数\n\n");
     Ok(())
     }
-
