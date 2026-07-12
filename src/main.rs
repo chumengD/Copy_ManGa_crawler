@@ -225,7 +225,7 @@ async fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn 
     print!("输入关键词：\n");
     let _ = io::stdout().flush();
     let key_word: String = read!();
-    let base_url = format!("{}/api/kb/web/searchcd/comics", &base_website);
+    let base_url = format!("{}/api/kb/web/searchci/comics", &base_website);
     let params = [
         ("offset", "0"),
         ("platform", "2"),
@@ -381,6 +381,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // 等待外层容器出现，确保页面已加载
     page.wait_for_navigation().await?;
 
+    // 方案：使用简单的 JS 等待，确保页面元素加载
+    let wait_script = r#"
+        new Promise((resolve) => {
+            const check = () => {
+                const el = document.getElementById('default全部');
+                if (el) { resolve(); }
+                else { setTimeout(check, 100); }
+            };
+            check();
+        })
+    "#;
+    let _ = page.evaluate(wait_script).await;
+
     let script = r#"
         (function() {
             window.Mydiv = document.getElementById('default全部');
@@ -407,7 +420,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     "#;
 
     let Ok(remote_object) = page.evaluate(script).await else{
-        panic!("获取漫画话数失败!");    
+        panic!("获取漫画话数失败!");
     };
 
     //dbg!(&remote_object);;
