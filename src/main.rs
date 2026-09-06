@@ -14,12 +14,12 @@ use std::{env ,error::Error};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use text_io::read;
 use winreg::RegKey;
 use winreg::enums::*;
-use std::fmt;
+use std::{fmt, result};
 
 use std::fs;
+use std::collections::HashSet;
 
 //浏览器
 use chromiumoxide::browser::{self, Browser, BrowserConfig, BrowserConfigBuilder};
@@ -33,7 +33,8 @@ use tokio::io::copy;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
 
 //注册表相关
@@ -42,10 +43,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// 声明 src/home.rs 为 crate 模块，否则 use crate::home::home 会报 E0432
 mod home;
-mod check_manga_update;
+
 use crate::home::home;
-use crate::check_manga_update::check_manga_update;
 
 //
 
@@ -111,32 +112,142 @@ impl fmt::Display for ErrorLog {
     }
 }
 
+/// run() 的退出原因：正常完成一部漫画，还是被 Ctrl+C 取消
+enum RunOutcome {
+    Completed,
+    Cancelled,
+}
+
+const INSTANCE_REGISTRY_DIR: &str = "manga_downloader_instances";
+const PROFILE_PREFIX: &str = "manga_downloader_profile_";
+
+fn register_instance(profile_name: &str) -> std::io::Result<()> {
+    let registry_dir = std::env::temp_dir().join(INSTANCE_REGISTRY_DIR);
+    fs::create_dir_all(&registry_dir)?;
+    let pid_file = registry_dir.join(format!("{}.pid", profile_name));
+    let my_pid = std::process::id();
+    fs::write(&pid_file, my_pid.to_string())?;
+    println!("实例已注册: {} (PID: {})", profile_name, my_pid);
+    Ok(())
+}
+
+fn unregister_instance(profile_name: &str) {
+    let pid_file = std::env::temp_dir()
+        .join(INSTANCE_REGISTRY_DIR)
+        .join(format!("{}.pid", profile_name));
+    let _ = fs::remove_file(&pid_file);
+}
+
+fn get_living_profiles() -> HashSet<String> {
+    let registry_dir = std::env::temp_dir().join(INSTANCE_REGISTRY_DIR);
+    let mut living = HashSet::new();
+    let mut stale_files: Vec<PathBuf> = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&registry_dir) {
+        let mut pid_checks: Vec<(String, u32)> = Vec::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "pid") {
+                if let Some(profile_name) = path.file_stem().and_then(|n| n.to_str()) {
+                    match fs::read_to_string(&path) {
+                        Ok(pid_str) => {
+                            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                                pid_checks.push((profile_name.to_string(), pid));
+                            } else {
+                                stale_files.push(path);
+                            }
+                        }
+                        Err(_) => stale_files.push(path),
+                    }
+                }
+            }
+        }
+
+        if !pid_checks.is_empty() {
+            let pid_list: Vec<String> = pid_checks.iter().map(|(_, pid)| pid.to_string()).collect();
+            let ps_script = format!(
+                r#"$pids = @({}); foreach ($p in $pids) {{ $alive = Get-Process -Id $p -ErrorAction SilentlyContinue; if ($alive) {{ Write-Output "ALIVE:$p" }} else {{ Write-Output "DEAD:$p" }} }}"#,
+                pid_list.join(",")
+            );
+
+            let alive_pids: HashSet<u32> = match Command::new("powershell")
+                .args(&["-NoProfile", "-Command", &ps_script])
+                .creation_flags(0x08000000)
+                .output()
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    stdout
+                        .lines()
+                        .filter(|line| line.starts_with("ALIVE:"))
+                        .filter_map(|line| line.trim_start_matches("ALIVE:").parse::<u32>().ok())
+                        .collect()
+                }
+                Err(_) => HashSet::new(),
+            };
+
+            for (profile_name, pid) in pid_checks {
+                if alive_pids.contains(&pid) {
+                    living.insert(profile_name);
+                } else {
+                    stale_files.push(registry_dir.join(format!("{}.pid", profile_name)));
+                }
+            }
+        }
+
+        for f in stale_files {
+            let _ = fs::remove_file(&f);
+        }
+    }
+
+    living
+}
+
 async fn kill_self_processes() {
-    // 关键修改：只匹配命名的"前缀"，这样无论后面随机数是多少，都能抓出来
-    // 注意：这里要跟你在 main 里面生成的文件夹前缀保持一致
-    let target_prefix = "manga_downloader_profile_";
+    let living = get_living_profiles();
 
     println!("正在扫描并清理后台僵尸进程...");
+    if !living.is_empty() {
+        println!("当前活跃实例: {:?}", living);
+    }
+
+    let living_patterns: Vec<String> = living.iter().map(|p| format!("'*{}*'", p)).collect();
+    let living_array = living_patterns.join(",");
 
     let ps_script = format!(
         r#"
-        $target = '*{}*'
-        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | 
-                 Where-Object {{ 
-                    ($_.Name -eq 'msedge.exe' -or $_.Name -eq 'chrome.exe') -and 
-                    $_.CommandLine -like $target 
+        $targetPrefix = '*{prefix}*'
+        $livingPatterns = @({living})
+
+        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                 Where-Object {{
+                    ($_.Name -eq 'msedge.exe' -or $_.Name -eq 'chrome.exe') -and
+                    $_.CommandLine -like $targetPrefix
                  }}
-        
+
         if ($procs) {{
-            $count = $procs.Count
-            $procs | ForEach-Object {{ 
-                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            $procs | ForEach-Object {{
+                $cmdLine = $_.CommandLine
+                $isLiving = $false
+                foreach ($pattern in $livingPatterns) {{
+                    if ($cmdLine -like $pattern) {{
+                        $isLiving = $true
+                        break
+                    }}
+                }}
+                if (-not $isLiving) {{
+                    Write-Output "清理僵尸进程 PID: $($_.ProcessId)"
+                    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                }} else {{
+                    Write-Output "保留活跃进程 PID: $($_.ProcessId)"
+                }}
             }}
         }} else {{
-            Write-Output "未发现相关的僵尸进程。"
+            Write-Output "未发现相关的浏览器进程。"
         }}
     "#,
-        target_prefix
+        prefix = PROFILE_PREFIX,
+        living = living_array
     );
 
     let output = Command::new("powershell")
@@ -147,32 +258,44 @@ async fn kill_self_processes() {
     match output {
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout);
+            if !stdout.trim().is_empty() {
+                println!("{}", stdout);
+            }
         }
         Err(e) => println!("无法执行清理脚本: {}", e),
     }
 }
 
 async fn clean_old_profiles() {
+    let living = get_living_profiles();
     let temp_dir = env::temp_dir();
 
-    // 读取 temp 目录下的所有内容
     if let Ok(entries) = fs::read_dir(temp_dir) {
-        for entry in entries.filter_map(Result::ok) {
+        for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            // 检查是不是我们的文件夹
             if path.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("manga_downloader_profile_") {
-                        // 尝试删除，失败了就忽略，绝不卡死程序
-                        if let Err(_) = fs::remove_dir_all(&path) {
-                            // 默默忽略，或者打印个 debug 信息
+                    if name.starts_with(PROFILE_PREFIX) {
+                        if living.contains(name) {
+                            println!("跳过活跃实例的文件夹: {}", name);
                         } else {
-                            println!("已清理过期缓存: {}", name);
+                            match fs::remove_dir_all(&path) {
+                                Ok(_) => println!("已清理过期缓存: {}", name),
+                                Err(e) => println!("无法删除 {}: {}", name, e),
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+async fn clean_own_profile(profile_name: &str) {
+    let profile_dir = env::temp_dir().join(profile_name);
+    match fs::remove_dir_all(&profile_dir) {
+        Ok(_) => println!("已清理自身缓存文件夹: {}", profile_name),
+        Err(e) => println!("无法清理自身缓存文件夹 {}: {}", profile_name, e),
     }
 }
 
@@ -225,25 +348,129 @@ fn get_browser_path_from_registry() -> Option<PathBuf> {
     None
 }
 
-async fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn Error>> {
-    print!("输入关键词：\n");
+/// input_cancellable() 的结果：读到一行输入，或等待期间被 Ctrl+C 取消
+enum InputOutcome {
+    Line(String),
+    Cancelled,
+}
+
+/// 全局唯一的 stdin 行接收器：由后台读取线程写入，所有输入点从这里取行，
+/// 这样等待输入期间按 Ctrl+C 也能立即被取消标志打断
+/// 注意：static 要求 Sync，而 mpsc::Receiver 只 Send 不 Sync，所以要套 Mutex
+static STDIN_LINES: OnceLock<Mutex<mpsc::Receiver<String>>> = OnceLock::new();
+
+/// 启动后台 stdin 读取线程：此后 stdin 只由该线程读取，输入点通过 channel 取行
+fn spawn_stdin_reader() {
+    let (tx, rx) = mpsc::channel::<String>();
+    let _ = STDIN_LINES.set(Mutex::new(rx));
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match io::stdin().read_line(&mut line) {
+                // EOF 或读取失败：退出线程（此时接收端会得到 Disconnected）
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    // 主程序已退出：停止发送
+                    if tx.send(line.trim().to_string()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// 显示提示并等待一行输入；等待期间按下 Ctrl+C 会立即返回 Cancelled，无需再按回车
+fn input_cancellable(
+    prompt: &str,
+    cancelled: &AtomicBool,
+) -> Result<InputOutcome, Box<dyn Error>> {
+    print!("{}", prompt);
     let _ = io::stdout().flush();
-    let key_word: String = read!();
+    // 全程序同一时刻只有一个输入点在等行，锁竞争可以忽略
+    let rx = STDIN_LINES
+        .get()
+        .expect("stdin 读取线程未初始化")
+        .lock()
+        .unwrap();
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            // 丢弃已排队但未消费的行，避免误喂给下一个提示
+            while rx.try_recv().is_ok() {}
+            return Ok(InputOutcome::Cancelled);
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => return Ok(InputOutcome::Line(line)),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("标准输入已关闭".into());
+            }
+        }
+    }
+}
+
+/// 提示并等待用户输入一个数字；输入无效则重新提示，按 Ctrl+C 返回 Ok(None)
+fn input_number(prompt: &str, cancelled: &AtomicBool) -> Result<Option<usize>, Box<dyn Error>> {
+    loop {
+        match input_cancellable(prompt, cancelled)? {
+            InputOutcome::Cancelled => return Ok(None),
+            InputOutcome::Line(line) => match line.parse::<usize>() {
+                Ok(n) => return Ok(Some(n)),
+                Err(_) => println!("输入无效，请输入数字。"),
+            },
+        }
+    }
+}
+
+async fn search(
+    client: Client,
+    base_website: &str,
+    cancelled: &AtomicBool,
+) -> Result<Option<Response>, Box<dyn Error>> {
+    // 输入关键词期间按了 Ctrl+C：直接放弃本次搜索
+    let key_word = match input_cancellable("输入关键词：\n", cancelled)? {
+        InputOutcome::Cancelled => return Ok(None),
+        InputOutcome::Line(line) => line,
+    };
     let base_url = format!("{}/api/kb/web/searchci/comics", &base_website);
     let params = [
         ("offset", "0"),
         ("platform", "2"),
-        ("limit", "12"), 
+        ("limit", "12"),
         ("q", &key_word),
         ("q_type", ""),
     ];
 
+let mut response: Option<reqwest::Response> = None;
 
-    let response = client.get(base_url).query(&params).send().await.expect("搜索失败1");
-    let response1 = client.get("https://ios.copymanga.club/search?q=1&q_type=").send().await.expect("搜索失败1");
+for _ in 0..5 {
+    // 重试期间按了 Ctrl+C：放弃本次搜索
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    match client.get(&base_url).query(&params).send().await {
+        Ok(res) => {
+            if res.status().is_success() {
+                response = Some(res);
+                break;
+            } else {
+                println!("搜索请求失败，状态码: {}，正在重试...", res.status());
+            }
+        }
+        Err(e) => {
+            println!("搜索请求发生错误: {}, 正在重试...", e);
+        }
+    }
+}
+    // let response = client.get(base_url).query(&params).send().await.expect("搜索失败1");
+    // let response1 = client.get("https://ios.copymanga.club/search?q=1&q_type=").send().await.expect("搜索失败1");
     //dbg!(&response);
 
-    let resp_text = response.text().await.expect("搜索失败2");
+    let Some(response) = response else {
+        return Err("搜索失败：重试 5 次后仍然没有成功响应".into());
+    };
+    let resp_text = response.text().await?;
     //dbg!(&resp_text);
     let resp_json: Response = serde_json::from_str(&resp_text)?;
     //dbg!(format!("\n\n\n resp_json= {}\n\n\n",&resp_json));
@@ -255,23 +482,19 @@ async fn search(client: Client, base_website: &str) -> Result<Response, Box<dyn 
     for (index, item) in lists.iter().enumerate() {
         println!("{}.{}", index, item.name);
     }
-    print!("请输入要下载的漫画序号：");
-    let _ = io::stdout().flush();
-    Ok(resp_json)
+    Ok(Some(resp_json))
 }
 
 
-async fn get_browser(client: Client) -> Result<(Browser,Handler), Box<dyn Error>> {
-    
-    let timestamp = 20260311u128;
-    let unique_profile_name = format!("manga_downloader_profile_{}", timestamp);
-    let user_data_path = env::temp_dir().join(&unique_profile_name);
+async fn get_browser(profile_name: &str) -> Result<(Browser, Handler), Box<dyn Error>> {
+
+    let user_data_path = env::temp_dir().join(profile_name);
 
 
     let builder:BrowserConfigBuilder = BrowserConfig::builder();
     let path = get_browser_path_from_registry().unwrap();
     println!("成功找到浏览器路径:{:?}",path);
-    println!("正在打开浏览器.......");
+    println!("正在打开浏览器 (profile: {}).......", profile_name);
 
 
     let options = builder
@@ -284,56 +507,27 @@ async fn get_browser(client: Client) -> Result<(Browser,Handler), Box<dyn Error>
             "--disable-setuid-sandbox",
             "--disable-gpu",
             "--disable-software-rasterizer",
-            "--disable-extensions",       // 禁用扩展
-            "--disable-infobars",         // 禁用顶部提示条
-            "--no-first-run",             // 禁止首次运行向导
-            "--no-default-browser-check", // 禁止询问是否设为默认浏览器
-            "--disable-infobars",         // 禁止顶部提示条
-            "--disable-extensions",       // 禁用扩展，提高速度
-            "--password-store=basic",     // 禁用系统密码弹窗 
+            "--disable-extensions",
+            "--disable-infobars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--password-store=basic",
             "--disable-dev-shm-usage",
             "about:blank",
             ])
         .build()?;
 
 
-        
-       let (browser,mut handler) = Browser::launch(options).await?;
+
+       let (browser, handler) = Browser::launch(options).await?;
        println!("成功打开浏览器！");
-       println!("\n\n\n"); 
+       println!("\n\n\n");
 
-    Ok((browser,handler))   
+    Ok((browser,handler))
 }
 
-
-#[tokio::main]
-async fn main() {
-    // 真正的逻辑放在 run() 里，main 只负责捕获错误
-    if let Err(e) = run().await {
-        eprintln!("\n==============================");
-        eprintln!("程序发生严重错误，已停止运行：");
-        eprintln!("{}", e);
-        eprintln!("==============================");
-    }
-
-    sleep(Duration::from_secs(180)).await;
-    println!("\n按回车键退出...");
-    let _ = std::io::stdin().read_line(&mut String::new());
-}
-
-async fn run() -> Result<(), Box<dyn Error>> {
-    kill_self_processes().await;
-    clean_old_profiles().await;
-    println!("======这是一个拷贝漫画的漫画下载器======");
-    println!("默认保存路径在当前文件夹的download文件夹下\n\n");
-    sleep(Duration::from_secs(2)).await;
-
-    //初始化数据
-    let mut download_chapters: Vec<Chapter> = Vec::new();
-    let base_website = "https://ios.copymanga.club";
-    let mut error_logs:Vec<ErrorLog> = Vec::new(); 
-
-    //初始化client
+fn get_client(base_website: &str)-> Result<Client, Box<dyn Error>> {
+     //初始化client
     let mut headers = HeaderMap::new();
     headers.insert(REFERER, base_website.parse().unwrap());
     let client = Client::builder()
@@ -341,23 +535,158 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .danger_accept_invalid_certs(true)
         .default_headers(headers)
         .build()?;
+    Ok(client)
+}
+
+#[tokio::main]
+async fn main() {
+    // 安装自定义 panic 钩子：出错时先打印错误信息，再等待用户按键，
+    // 防止程序一报错窗口立即关闭、来不及看错误内容
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        default_hook(panic_info);
+        pause_on_error();
+    }));
+
+    // 真正的逻辑放在 real_main() 中：出错时打印错误信息并暂停，而不是直接关闭窗口
+    if let Err(e) = manager().await {
+        eprintln!("\n==============================");
+        eprintln!("程序发生错误，已停止运行：");
+        eprintln!("{}", e);
+        eprintln!("==============================");
+        pause_on_error();
+    }
+}
+
+/// 报错后等待用户按回车再退出，避免窗口立即关闭看不到错误信息
+fn pause_on_error() {
+    eprintln!("按回车键退出...");
+    // 优先从统一的后台读取线程取行（如果已启动），否则退回直接读 stdin
+    match STDIN_LINES.get() {
+        Some(m) => {
+            let _ = m.lock().unwrap().recv();
+        }
+        None => {
+            let mut _s = String::new();
+            let _ = std::io::stdin().read_line(&mut _s);
+        }
+    }
+}
+
+async fn manager() -> Result<(), Box<dyn Error>> {
+    // 启动时一次性清理僵尸进程和过期缓存（保护其他活跃实例）
+    kill_self_processes().await;
+    clean_old_profiles().await;
+    let base_website = "https://ios.copymanga.club";
+
+    // 生成唯一 profile 名并注册，防止其他实例误杀本进程的浏览器
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis();
+
+    let profile_name = format!("{}{}", PROFILE_PREFIX, timestamp);
+    register_instance(&profile_name)?;
+
+    // 启动后台 stdin 读取线程：之后所有输入都从它的 channel 取行，
+    // 保证等待输入期间 Ctrl+C 也能立即生效
+    spawn_stdin_reader();
 
 
+    let client = get_client(base_website)?;
 
-    let (mut browser,mut handler) = get_browser(client.clone()).await?;
-   
+    let (mut browser, mut handler) = get_browser(&profile_name).await?;
+
     tokio::spawn(async move{
         while let Some(event) =handler.next().await {}
     });
     //初始化结束
 
+    // 全局 Ctrl+C 监听：整个程序只注册一次，任何时候按下都会置位取消标志
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = cancelled.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::signal::ctrl_c().await.ok();
+            flag.store(true, Ordering::SeqCst);
+            println!("\n⚠ 收到 Ctrl+C，正在返回搜索...");
+        }
+    });
 
-    let resp_json:Response = search(client.clone(), &base_website).await.expect("搜索函数运行失败");
+    'outer: loop {
+        // 每次重新进入 run（搜索）前复位取消标志，避免上一次的 Ctrl+C 影响本次
+        cancelled.store(false, Ordering::SeqCst);
+
+        // 真正的逻辑放在 run() 里，main 只负责捕获错误；浏览器在 main 中只启动一次，多部漫画复用同一个浏览器
+        match run(client.clone(), &browser, base_website, cancelled.clone()).await {
+            Err(e) => {
+                eprintln!("\n==============================");
+                eprintln!("程序发生严重错误，已停止运行：");
+                eprintln!("{}", e);
+
+                eprintln!("==============================");
+            }
+            // Ctrl+C 取消：跳过 y/n 询问，直接回到搜索
+            Ok(RunOutcome::Cancelled) => continue 'outer,
+            Ok(RunOutcome::Completed) => {}
+        }
+
+        // 一部漫画下载完成后，询问是否继续（y 继续下载下一部，n 退出程序）
+        loop {
+            match input_cancellable("是否继续下载? (y/n)", &cancelled)? {
+                // 等待输入期间按了 Ctrl+C：回到搜索
+                InputOutcome::Cancelled => continue 'outer,
+                InputOutcome::Line(line) => match line.to_lowercase().as_str() {
+                    "y" => break,
+                    "n" => break 'outer,
+                    _ => println!("输入无效，请输入 'y' 或 'n'。"),
+                },
+            }
+        }
+    }
+
+    // 程序退出：关闭浏览器并清理自身实例
+    if let Err(e) = browser.close().await {
+        eprintln!("关闭浏览器时出错: {}", e);
+    }
+    unregister_instance(&profile_name);
+    clean_own_profile(&profile_name).await;
+
+    Ok(())
+}
+
+async fn run(
+    client: Client,
+    browser: &Browser,
+    base_website: &str,
+    cancelled: Arc<AtomicBool>,
+) -> Result<RunOutcome, Box<dyn Error>> {
+    println!("======这是一个拷贝漫画的漫画下载器======");
+    println!("默认保存路径在当前文件夹的download文件夹下\n\n");
+
+    //初始化数据
+    let mut download_chapters: Vec<Chapter> = Vec::new();
+    let error_logs: Vec<ErrorLog> = Vec::new();
+
+    // Ctrl+C 监听在 real_main() 中全局只注册一次，这里通过检查 cancelled 标志响应取消
+
+
+    // 搜索（含输入关键词）期间按了 Ctrl+C：直接回到搜索
+    let Some(resp_json) = search(client.clone(), base_website, &cancelled).await? else {
+        println!("⚠ 已取消，返回搜索...");
+        return Ok(RunOutcome::Cancelled);
+    };
     //dbg!(&resp_json);
-    let choice: i32 = read!();
+    let Some(choice) = input_number("请输入要下载的漫画序号：", &cancelled)? else {
+        println!("⚠ 已取消，返回搜索...");
+        return Ok(RunOutcome::Cancelled);
+    };
     println!("请稍后...");
     let lists = &resp_json.results.list;
-    let selected_item = lists[choice as usize].clone();
+    if choice >= lists.len() {
+        println!("序号超出范围，返回搜索...");
+        return Ok(RunOutcome::Cancelled);
+    }
+    let selected_item = lists[choice].clone();
     let title = selected_item.name.clone();
     let path_word = selected_item.path_word.clone();
 
@@ -370,14 +699,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
    let mut wait_count = 0;
 let max_retries = 20;
 
-while (wait_count < max_retries) {
+while wait_count < max_retries {
+    if cancelled.load(Ordering::SeqCst) {
+        println!("⚠ 已取消，返回搜索...");
+        page.close().await.ok();
+        return Ok(RunOutcome::Cancelled);
+    }
     // 尝试寻找该元素
     if page.find_element("#default全部").await.is_ok() {
         println!("目标容器 #default全部 已挂载到 DOM！");
         break;
     }
-    
+
     tokio::time::sleep(Duration::from_millis(500)).await;
+    println!("{}",format!("加载失败，正在重试 ({} / {})", wait_count + 1, max_retries));
     wait_count += 1;
 }
 
@@ -392,14 +727,14 @@ while (wait_count < max_retries) {
             window.Mydiv = document.getElementById('default全部');
             const container = window.Mydiv;
             if (!container) return [];
-            
+
             const links = container.querySelectorAll('ul a');
             const data = {
                 names: [],
                 path_words:[],
                 len:0
             };
-            
+
             for (const link of links) {
                 // 模拟你的逻辑：确保 a 标签里有 li 标签
                 if (link.querySelector('li')) {
@@ -413,7 +748,28 @@ while (wait_count < max_retries) {
     "#;
 
     let Ok(remote_object) = page.evaluate(script).await else{
-        panic!("获取漫画话数失败!");    
+        panic!("获取漫画话数失败!");
+    };
+
+    let Ok(remote_object) = timeout(Duration::from_secs(30), async {
+        let result = timeout(Duration::from_secs(5), async {
+            loop {
+                match page.evaluate(script).await {
+                    Ok(res) => break res,
+                    Err(_) => {
+                        println!("获取漫画话数失败，正在重试...");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("多次重试后仍无法获取漫画话数，可能是网页结构改变或网络问题，跳过该漫画");
+
+        result
+        })
+    .await
+    else {
+        panic!("获取漫画话数超时，可能是网页结构改变或网络问题，跳过该漫画");
     };
 
     //dbg!(&remote_object);;
@@ -421,6 +777,11 @@ while (wait_count < max_retries) {
     //dbg!("js获取的数据是",&object);
     let json_str = object.as_str().expect("JS返回的不是字符串");
     let js_chapters: Js_chapters = serde_json::from_str(json_str).unwrap();
+    if cancelled.load(Ordering::SeqCst) {
+        println!("⚠ 已取消，返回搜索...");
+        page.close().await.ok();
+        return Ok(RunOutcome::Cancelled);
+    }
     // dbg!(&js_chapters);
     let counts = js_chapters.len;
     let names = &js_chapters.names;
@@ -430,27 +791,31 @@ while (wait_count < max_retries) {
         println!("{}:{}", index + 1, name);
     }
     println!("\n该漫画共有{}话\n", counts);
-    
 
-    print!("请输入起始话数(包含该话)：");
-    let _ = io::stdout().flush();
 
-    let start: usize = read!();
-    let start = start - 1;
-    if start >= counts {
+    let Some(start) = input_number("请输入起始话数(包含该话)：", &cancelled)? else {
+        println!("⚠ 已取消，返回搜索...");
+        page.close().await.ok();
+        return Ok(RunOutcome::Cancelled);
+    };
+    if start == 0 || start > counts {
         println!("输入的话数有误");
         sleep(Duration::from_secs(3)).await;
-        return Ok(());
+        page.close().await.ok();
+        return Ok(RunOutcome::Completed);
     }
+    let start = start - 1;
 
-    print!("请输入结束话数(包含该话)：");
-    let _ = io::stdout().flush();
-
-    let end: usize = read!();
+    let Some(end) = input_number("请输入结束话数(包含该话)：", &cancelled)? else {
+        println!("⚠ 已取消，返回搜索...");
+        page.close().await.ok();
+        return Ok(RunOutcome::Cancelled);
+    };
     if end > counts || end <= start {
         println!("输入的话数有误");
         sleep(Duration::from_secs(3)).await;
-        return Ok(());
+        page.close().await.ok();
+        return Ok(RunOutcome::Completed);
     }
 
     // 先收集需要下载的章节基本信息（url 和 title）
@@ -465,7 +830,7 @@ while (wait_count < max_retries) {
         });
     }
 
-    page.close();
+    page.close().await?;
 
     // 解析章节页面的初始化
     let mut one_tab_count: usize = 0;
@@ -475,12 +840,20 @@ while (wait_count < max_retries) {
         .expect("解析第一话时，页面打开失败");
 
     // ===== 核心改动：解析一章，立即下载一章 =====
+    let mut was_cancelled = false;
     for chapter in &mut download_chapters {
+
+        // 检查是否收到 Ctrl+C 中断信号
+        if cancelled.load(Ordering::SeqCst) {
+            println!("⚠ 已取消，返回搜索...");
+            was_cancelled = true;
+            break;
+        }
 
         // 限制单个 tab 解析章节数，防止内存泄漏
         one_tab_count += 1;
         if one_tab_count >= 20 {
-            chapter_tab.close();
+            chapter_tab.close().await?;
             one_tab_count = 0;
             chapter_tab = browser
                 .new_page(&chapter.url)
@@ -496,15 +869,15 @@ while (wait_count < max_retries) {
         let script = r#"(async () => {
             return await new Promise((resolve) => {
                 // --- 配置区 (可根据网速调整) ---
-                const scrollStep = 500;   
-                const frequency = 16;    
-                const waitTime = 1500;   
+                const scrollStep = 500;
+                const frequency = 16;
+                const waitTime = 1500;
                 // ---------------------------
 
                 let totalHeight = 0;
                 let noChangeTicks = 0;
-                
-                const maxTicks = waitTime / frequency; 
+
+                const maxTicks = waitTime / frequency;
 
                 const timer = setInterval(() => {
                     const scrollHeight = document.body.scrollHeight;
@@ -525,16 +898,16 @@ while (wait_count < max_retries) {
                         // 如果连续 N 次循环高度都没变，说明真的到底了
                         if (noChangeTicks >= maxTicks) {
                             clearInterval(timer);
-                            
+
                             // 3. 抓取结果
-                            let images = document.querySelectorAll('img'); 
+                            let images = document.querySelectorAll('img');
                             let urls = [];
                             images.forEach((img) => {
                                 // 优先 data-src，其次 src
                                 let url = img.getAttribute('data-src');
                                 if (url) urls.push(url);
                             });
-                            
+
                             resolve(JSON.stringify(urls));
                         }
                     } else {
@@ -568,14 +941,23 @@ while (wait_count < max_retries) {
             chapter.number, chapter.title, chapter.len
         );
 
+        // 解析期间按了 Ctrl+C：放弃下载该章，直接返回搜索
+        if cancelled.load(Ordering::SeqCst) {
+            println!("⚠ 已取消，返回搜索...");
+            was_cancelled = true;
+            break;
+        }
+
         // ===== 解析完一章后，立即下载该章 =====
-        new_download(vec![chapter.clone()], title.clone(), client.clone()).await?;
+        new_download(vec![chapter.clone()], title.clone(), client.clone(), cancelled.clone()).await?;
     }
 
-    chapter_tab.close();
-    browser.close().await?;
+    chapter_tab.close().await?;
 
-    clean_old_profiles().await;
+    // 因 Ctrl+C 中断：跳过完成提示，直接返回搜索
+    if was_cancelled {
+        return Ok(RunOutcome::Cancelled);
+    }
 
     // 打印错误日志
     for log in error_logs {
@@ -584,139 +966,23 @@ while (wait_count < max_retries) {
 
     println!("\n全部章节解析并下载完成！");
 
-    Ok(())
+    Ok(RunOutcome::Completed)
 }
-
-async fn download(
-    chapters: Vec<Chapter>,
-    title: String,
-    client: Client,
-) -> Result<(), Box<dyn Error>> {
-       //为多线程下载做准备，限制线程数量
-        let once_max_dowload = Arc::new(Semaphore::new(64));
-
-    for chapter in chapters {
-        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
-        //创建漫画文件夹
-        let path = format!("./download/{}/{}", title, chapter.title);
-        fs::create_dir_all(&path)?;
-
-        //创建进度条
-        let pb = ProgressBar::new(chapter.len as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}")
-            .unwrap()
-            .progress_chars("█=>"));
-        pb.set_message(format!("下载中: {}", chapter.title));
-        //创建进度条
-
- 
-
-        for (index, page_url) in chapter.pages_url.iter().enumerate() {
-            let client_clone = client.clone();
-            let chapter_clone = chapter.clone();
-            let page_len_clone = chapter.pages_url.len().clone();
-            let title_clone = title.clone();
-            let page_url_clone = page_url.clone();
-            let pb_clone = pb.clone();                                
-
-            let once_max_download_clone = once_max_dowload.clone();
-
-        //创建子进程
-        let handle = tokio::spawn(async move{
-                let aquire = once_max_download_clone.acquire_owned().await.unwrap();
-
-                let page_path = format!(
-                    "./download/{}/{}/{}.webp",
-                    title_clone,
-                    chapter_clone.title,
-                    index + 1
-                );
-                let max_retries = 3;
-
-                //在开始下载前创建相应图片文件
-                let mut page = tokio::fs::File::create(&page_path).await.unwrap();
-                for i in 1..=max_retries {
-
-
-                    //发送网络请求
-                    let response = client_clone.
-                    get(&page_url_clone)
-                    .send()
-                    .await;
-
-                    match response {
-                        Ok(mut res) => {
-                            let mut bytes = res.bytes_stream();
-
-                        //流下载    
-                        while let Some(chunk) = bytes.next().await {
-                                match chunk {
-                                    Ok(chunk) => {
-                                        page.write_all(&chunk).await.unwrap();
-                                        
-                                    }
-                                    Err(e) => {
-                                        println!("下载出错: {}", e);
-                                        println!("正在重试第{}次",i);
-                                        break;
-                                    }
-                                }
-                            } 
-                        pb_clone.inc(1);
-                        break;
-                            }
-
-
-                        Err(e) => {
-                            println!(
-                                "发起请求失败：{}第{}页",
-                                chapter_clone.title,
-                                index + 1,
-                                
-                            );
-                            if i < max_retries {
-                                println!("正在重试第{}次...", i);
-                            } else {
-                                println!("达到最大重试次数，跳过该页");
-                            }
-                            sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-                
-            });
-
-            handles.push(handle);
-        }
-
-        for handle in handles {
-             let _ = handle.await;
-            }
-
-        pb.finish_with_message(format!("{} 下载完毕", chapter.title));
-    
-        }
-    
-       
-    println!("\n所有章节下载完成！");
-    println!("温馨提醒：");
-    println!("会有极小概率一话页数没有完整加载出来，导致尾部缺页情况发生，");
-    println!("可以根据每话之间的页数对比 or 是否有汉化组尾页来确定是否缺页");
-    println!("重新下载该话能补全页数\n\n");
-    Ok(())
-    }
 
 async fn new_download(
     chapters: Vec<Chapter>,
     title: String,
     client: Client,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
        //为多线程下载做准备，限制线程数量
         let once_max_dowload = Arc::new(Semaphore::new(64));
 
     for chapter in chapters {
+        // 已取消：不再派发本章剩余页面的下载任务
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         //创建漫画文件夹
@@ -732,20 +998,29 @@ async fn new_download(
         pb.set_message(format!("下载中: {}", chapter.title));
         //创建进度条
 
- 
+
 
         for (index, page_url) in chapter.pages_url.iter().enumerate() {
+            // 已取消：停止派发剩余页面
+            if cancelled.load(Ordering::SeqCst) {
+                break;
+            }
             let client_clone = client.clone();
             let chapter_clone = chapter.clone();
             let page_len_clone = chapter.pages_url.len().clone();
             let title_clone = title.clone();
             let page_url_clone = page_url.clone();
-            let pb_clone = pb.clone();                                
+            let pb_clone = pb.clone();
 
             let once_max_download_clone = once_max_dowload.clone();
+            let cancelled_clone = cancelled.clone();
 
         //创建子进程
         let handle = tokio::spawn(async move{
+                // 已取消：直接结束，不参与下载
+                if cancelled_clone.load(Ordering::SeqCst) {
+                    return;
+                }
                 let aquire = once_max_download_clone.acquire_owned().await.unwrap();
 
                 let page_path = format!(
@@ -758,10 +1033,14 @@ async fn new_download(
 
 
                 //在开始下载前创建相应图片文件
-                let timeout_result = timeout(limit, async {             
-                        
+                let timed_out = timeout(limit, async {
+
                     let mut isErr :bool = false;
                     loop{
+                        // 已取消：放弃当前页的下载与重试
+                        if cancelled_clone.load(Ordering::SeqCst) {
+                            break;
+                        }
 
                         let mut page = tokio::fs::File::create(&page_path).await.unwrap();
 
@@ -775,13 +1054,27 @@ async fn new_download(
                             Ok(res) =>{
 
                                 let mut steam = res.bytes_stream();
+                                let mut aborted = false;
 
                                     while let Some(chunk) = steam.next().await{
+                                        // 接收数据期间按了 Ctrl+C：停止接收
+                                        if cancelled_clone.load(Ordering::SeqCst) {
+                                            aborted = true;
+                                            break;
+                                        }
                                         if let Ok(chunk) = chunk{
                                             page.write_all(&chunk).await.unwrap();
                                         }
                                     }
-                                    
+
+                                    if aborted {
+                                        // 先关闭文件句柄（Windows 上打开中的文件无法删除），
+                                        // 再删掉写了一半的图片，避免留下损坏文件
+                                        drop(page);
+                                        let _ = tokio::fs::remove_file(&page_path).await;
+                                        break;
+                                    }
+
                                     if isErr {
                                         println!("{}:第{}页下载重试完成，下载成功！",chapter_clone.title,index+1);
                                     }
@@ -795,32 +1088,45 @@ async fn new_download(
                                 }
                             }
                         }
-                        
-                    } 
+
+                    }
                })
                 .await
-                .expect("超过重试时长(60s)，跳过下载该页");
-                    
-    
-                    }   
+                .is_err();
+
+                // 超时：跳过该页并删掉不完整的文件，而不是 panic 退出整个程序
+                if timed_out {
+                    println!("{}:第{}页下载超时(60s)，跳过该页", chapter_clone.title, index + 1);
+                    let _ = tokio::fs::remove_file(&page_path).await;
+                }
+
+
+                    }
             );
 
             handles.push(handle);
         }
 
         for handle in handles {
-             let _ = handle.await;
+            if let Err(e) = handle.await {
+                eprintln!("下载任务失败: {}", e);
             }
+        }
+
+        if cancelled.load(Ordering::SeqCst) {
+            pb.finish_with_message(format!("{} 下载已取消", chapter.title));
+            return Ok(());
+        }
 
         pb.finish_with_message(format!("{} 下载完毕", chapter.title));
-    
+
         }
-    
-       
-    println!("\n所有章节下载完成！");
-    println!("温馨提醒：");
-    println!("会有极小概率一话页数没有完整加载出来，导致尾部缺页情况发生，");
-    println!("可以根据每话之间的页数对比 or 是否有汉化组尾页来确定是否缺页");
-    println!("重新下载该话能补全页数\n\n");
+
+
+    // println!("\n所有章节下载完成！");
+    // println!("温馨提醒：");
+    // println!("会有极小概率一话页数没有完整加载出来，导致尾部缺页情况发生，");
+    // println!("可以根据每话之间的页数对比 or 是否有汉化组尾页来确定是否缺页");
+    // println!("重新下载该话能补全页数\n\n");
     Ok(())
     }
