@@ -42,6 +42,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod home;
+mod check_manga_update;
+use crate::home::home;
+use crate::check_manga_update::check_manga_update;
 
 //
 
