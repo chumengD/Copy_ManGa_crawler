@@ -25,10 +25,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 
 pub mod types;
-use types::{ChapterContents, ChapterDetails, Config, LocalManga, ManGa_item, MangaUpdate, Response};
+use types::{ChapterContents, ChapterDetails, LocalManga, ManGa_item, MangaUpdate, Response};
 
 use regex::Regex;
 use anyhow::{anyhow, bail, Context};
+
+/// 站点地址直接硬编码，不再依赖外部 config.toml
+pub const BASE_WEBSITE: &str = "https://ios.copymanga.club";
 
 /// 相邻网络请求之间的最小间隔，避免请求过快触发站点限流（Too Many Requests）
 const REQUEST_DELAY: Duration = Duration::from_millis(1000);
@@ -394,14 +397,6 @@ fn extract_chapter_secrets(html: &str) -> Result<(String, String)> {
         .ok_or_else(|| anyhow!("阅读页中未找到 contentKey"))?;
 
     Ok((cct, content_key))
-}
-
-pub async fn load_config() -> Result<Config> {
-    let contents = read_to_string("config.toml")
-        .await
-        .context("读取 config.toml 失败")?;
-    let config = toml::from_str::<Config>(&contents).context("解析 config.toml 失败")?;
-    Ok(config)
 }
 
 pub async fn save_chapter_details(
