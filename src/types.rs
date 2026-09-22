@@ -60,11 +60,6 @@ impl fmt::Display for ErrorLog {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Config {
-    pub base_website: String,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChapterDetails {
     pub name: String,

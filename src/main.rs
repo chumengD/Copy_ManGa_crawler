@@ -1,7 +1,7 @@
 use Copy_ManGa_downloader::types::Chapter;
 use Copy_ManGa_downloader::{
-    check_manga_updates, display_chapter_list, download, fetch_chapter_contents,
-    fetch_chapter_outline, get_client, input_number, load_config, pause_on_error,
+    BASE_WEBSITE, check_manga_updates, display_chapter_list, download, fetch_chapter_contents,
+    fetch_chapter_outline, get_client, input_number, pause_on_error,
     save_chapter_details, search, update_selected_mangas
 };
 use anyhow::Context;
@@ -12,18 +12,7 @@ use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main(){
-    let config = match load_config().await {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("\n==============================");
-            eprintln!("读取配置失败，已停止运行：");
-            eprintln!("{}", e);
-            eprintln!("==============================");
-            pause_on_error();
-            return;
-        }
-    };
-    let base_website = config.base_website.as_str();
+    let base_website = BASE_WEBSITE;
     let client = match get_client(base_website) {
         Ok(c) => c,
         Err(e) => {
