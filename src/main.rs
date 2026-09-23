@@ -1,8 +1,9 @@
 use Copy_ManGa_downloader::types::Chapter;
 use Copy_ManGa_downloader::{
-    BASE_WEBSITE, check_manga_updates, display_chapter_list, download, fetch_chapter_contents,
-    fetch_chapter_outline, get_client, input_number, pause_on_error,
-    save_chapter_details, search, update_selected_mangas
+    BASE_WEBSITE, check_manga_update, check_manga_updates, display_chapter_list, download,
+    fetch_chapter_contents, fetch_chapter_outline, get_client, input_number, pause_on_error,
+    read_manga_downloaded, save_chapter_details, search, set_manga_completed,
+    update_selected_mangas,
 };
 use anyhow::Context;
 use reqwest::Client;
@@ -44,8 +45,8 @@ async fn main(){
         if cancelled_count.load(Ordering::SeqCst) >=2{
             break 'outer;
         }
-       println!("1:搜索  2:检查漫画更新  3：退出");
-        let choice =input_number("你想要干什么：", &cancelled).await;
+       println!("1:搜索  2:指定漫画检查更新  3:检查全部更新  4:标记完结  5:退出");
+       let choice =input_number("你想要干什么：", &cancelled).await;
 
         
         match choice{
@@ -61,6 +62,21 @@ async fn main(){
                                 }
                             }
                             2 => {
+                                if let Err(e) = check_selected_manga_update(
+                                    client.clone(),
+                                    base_website,
+                                    cancelled.clone(),
+                                )
+                                .await
+                                {
+                                    eprintln!("\n==============================");
+                                    eprintln!("检查更新失败：");
+                                    eprintln!("{}", e);
+                                    eprintln!("==============================");
+                                    pause_on_error();
+                                }
+                            }
+                            3 => {
                                 if let Err(e) = async {
                                     let updates =
                                         check_manga_updates(client.clone(), base_website, &cancelled).await?;
@@ -75,7 +91,16 @@ async fn main(){
                                     pause_on_error();
                                 }
                             }
-                            3 =>{
+                            4 => {
+                                if let Err(e) = mark_manga_completed(cancelled.clone()).await {
+                                    eprintln!("\n==============================");
+                                    eprintln!("标记完结失败：");
+                                    eprintln!("{}", e);
+                                    eprintln!("==============================");
+                                    pause_on_error();
+                                }
+                            }
+                            5 =>{
                                 println!("正在退出程序.....");
                                 break 'outer;
                             }
@@ -95,6 +120,92 @@ async fn main(){
         }
     }
 
+
+async fn mark_manga_completed(cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
+    let local_mangas = read_manga_downloaded().await?;
+    if local_mangas.is_empty() {
+        println!("本地还没有已下载的漫画");
+        return Ok(());
+    }
+
+    println!("\n本地漫画:");
+    for (index, manga) in local_mangas.iter().enumerate() {
+        let status = if manga.completed { "已完结" } else { "未完结" };
+        println!("{}.{} [{}]", index, manga.name, status);
+    }
+    println!(
+        "输入 0-{0} 选择一部漫画，输入 {0} 以外的数字返回",
+        local_mangas.len() - 1
+    );
+
+    let Some(choice) = input_number("请输入要标记的漫画序号：", &cancelled).await else {
+        return Ok(());
+    };
+    let Some(manga) = local_mangas.get(choice) else {
+        println!("序号超出范围，返回主菜单...");
+        return Ok(());
+    };
+
+    let new_status = !manga.completed;
+    set_manga_completed(&manga.name, new_status).await?;
+    if new_status {
+        println!("已将 {} 标记为已完结，检查更新时会跳过", manga.name);
+    } else {
+        println!("已将 {} 标记为未完结，检查更新时会正常检查", manga.name);
+    }
+    Ok(())
+}
+
+async fn check_selected_manga_update(
+    client: Client,
+    base_website: &str,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_mangas = read_manga_downloaded().await?;
+    if local_mangas.is_empty() {
+        println!("本地还没有已下载的漫画");
+        return Ok(());
+    }
+
+    println!("\n本地漫画:");
+    for (index, manga) in local_mangas.iter().enumerate() {
+        let status = if manga.completed { "已完结" } else { "未完结" };
+        println!(
+            "{}.{} (已下载 {} 话) [{}]",
+            index,
+            manga.name,
+            manga.chapter_names.len(),
+            status
+        );
+    }
+    println!(
+        "输入 0-{0} 选择一部漫画，输入 {0} 以外的数字返回",
+        local_mangas.len() - 1
+    );
+
+    let Some(choice) = input_number("请输入要检查更新的漫画序号：", &cancelled).await else {
+        return Ok(());
+    };
+    let Some(manga) = local_mangas.get(choice) else {
+        println!("序号超出范围，返回主菜单...");
+        return Ok(());
+    };
+
+    let update = check_manga_update(client.clone(), base_website, manga, &cancelled).await?;
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    match update {
+        Some(update) => {
+            update_selected_mangas(vec![update], client, cancelled).await
+        }
+        None => {
+            println!("{} 没有可下载的新章节", manga.name);
+            Ok(())
+        }
+    }
+}
 
 async fn run(client:Client,base_website:&str,cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
     

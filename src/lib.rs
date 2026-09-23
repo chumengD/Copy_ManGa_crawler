@@ -143,7 +143,7 @@ pub async fn fetch_chapter_outline(
         return Err("漫画详情页请求失败：重试 5 次后仍然没有成功响应".into());
     };
     let (key, dnts) = extract_page_secrets(&html)?;
-    dbg!(format!("\n\n\n key= {}\n dnts= {}\n\n\n",&key,&dnts));
+    // dbg!(format!("\n\n\n key= {}\n dnts= {}\n\n\n",&key,&dnts));
 
     // 连续请求详情页与章节接口之间歇一下
     sleep(REQUEST_DELAY).await;
@@ -211,6 +211,7 @@ pub async fn fetch_chapter_outline(
     Ok(Some(ChapterDetails {
         name: manga.name.clone(),
         path_word: path_word.to_string(),
+        completed: false,
         chapters: extract_chapter_contents(&payload),
     }))
 }
@@ -416,7 +417,52 @@ pub async fn save_chapter_details(
     create_dir_all(&output_dir)
         .await
         .with_context(|| format!("创建目录失败: {}", output_dir.display()))?;
-    let json = serde_json::to_string_pretty(details).context("章节详情序列化为 JSON 失败")?;
+
+    // 落盘时保留已有的完结标记，避免检查/更新章节时把用户手动标记的完结状态冲掉。
+    let mut details = details.clone();
+    if let Ok(text) = read_to_string(&output_path).await {
+        if let Ok(existing) = serde_json::from_str::<ChapterDetails>(&text) {
+            details.completed = existing.completed;
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&details).context("章节详情序列化为 JSON 失败")?;
+    write(&output_path, format!("{json}\n"))
+        .await
+        .with_context(|| format!("写入章节详情失败: {}", output_path.display()))?;
+
+    Ok(output_path)
+}
+
+/// 读写 `<漫画名>.json` 里的完结标记；文件不存在时会先建一个最小 JSON。
+pub async fn set_manga_completed(manga_name: &str, completed: bool) -> Result<PathBuf> {
+    let file_stem = sanitize_file_name(manga_name);
+    let dir_name = if manga_name.trim().is_empty() {
+        file_stem.clone()
+    } else {
+        manga_name.to_string()
+    };
+    let output_dir = Path::new("download").join(&dir_name);
+    let output_path = output_dir.join(format!("{file_stem}.json"));
+
+    create_dir_all(&output_dir)
+        .await
+        .with_context(|| format!("创建目录失败: {}", output_dir.display()))?;
+
+    let mut details = match read_to_string(&output_path).await {
+        Ok(text) => serde_json::from_str::<ChapterDetails>(&text).with_context(|| {
+            format!("解析章节详情失败: {}", output_path.display())
+        })?,
+        Err(_) => ChapterDetails {
+            name: manga_name.to_string(),
+            path_word: String::new(),
+            completed: false,
+            chapters: Vec::new(),
+        },
+    };
+    details.completed = completed;
+
+    let json = serde_json::to_string_pretty(&details).context("章节详情序列化为 JSON 失败")?;
     write(&output_path, format!("{json}\n"))
         .await
         .with_context(|| format!("写入章节详情失败: {}", output_path.display()))?;
@@ -699,9 +745,11 @@ pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> 
             }
         }
 
+        let (path_word, completed) = read_local_meta(&path, name).await;
         mangas.push(LocalManga {
             name: name.to_string(),
-            path_word: read_local_path_word(&path, name).await,
+            path_word,
+            completed,
             chapter_names,
         });
     }
@@ -709,19 +757,26 @@ pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> 
     Ok(mangas)
 }
 
-/// 从本地 `<漫画名>.json` 里读出 path_word。
-/// 这是缓存：文件不存在或格式不兼容时都返回 None，由调用方决定是否兜底。
-async fn read_local_path_word(manga_dir: &Path, name: &str) -> Option<String> {
+/// 从本地 `<漫画名>.json` 里读出 path_word 和完结标记。
+/// 文件不存在或格式不兼容时返回 `(None, false)`，由调用方决定是否兜底。
+async fn read_local_meta(manga_dir: &Path, name: &str) -> (Option<String>, bool) {
     let metadata_path = manga_dir.join(format!("{}.json", sanitize_file_name(name)));
-    let text = read_to_string(metadata_path).await.ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
+    let Ok(text) = read_to_string(metadata_path).await else {
+        return (None, false);
+    };
+    let Ok(details) = serde_json::from_str::<ChapterDetails>(&text) else {
+        return (None, false);
+    };
 
-    value
-        .get("path_word")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|path_word| !path_word.is_empty())
-        .map(str::to_string)
+    let path_word = {
+        let path_word = details.path_word.trim();
+        if path_word.is_empty() {
+            None
+        } else {
+            Some(path_word.to_string())
+        }
+    };
+    (path_word, details.completed)
 }
 
 async fn find_path_word_by_name(
@@ -769,6 +824,111 @@ async fn find_path_word_by_name(
     Err("搜索漫画 ID 失败：重试 3 次后仍然没有成功响应".into())
 }
 
+/// 检查单部漫画的更新。
+/// 返回 `Ok(Some(update))` 表示有新章节；`Ok(None)` 表示无更新、被跳过或已取消。
+async fn check_single_manga_update(
+    client: Client,
+    base_website: &str,
+    manga: &LocalManga,
+    cancelled: &AtomicBool,
+) -> Result<Option<MangaUpdate>, Box<dyn Error>> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    if manga.completed {
+        println!("{} 已完结，跳过检查更新", manga.name);
+        return Ok(None);
+    }
+
+    println!("正在检查: {}", manga.name);
+
+    // 新版下载会在漫画文件夹里留下 <漫画名>.json，里面已缓存 path_word，直接用即可；
+    // 只有旧版下载没有该 JSON 时，才联网用名称反查 path_word。
+    let path_word = match manga.path_word.clone() {
+        Some(path_word) => {
+            println!("使用本地记录的漫画 ID: {}", path_word);
+            path_word
+        }
+        None => {
+            println!("本地缺少漫画 ID，正在联网查找 {} ...", manga.name);
+            let Some(found) =
+                find_path_word_by_name(client.clone(), base_website, &manga.name, cancelled).await?
+            else {
+                if cancelled.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                println!("[!] {} 没有找到精确匹配的线上漫画，已跳过", manga.name);
+                return Ok(None);
+            };
+            found
+        }
+    };
+
+    let online = fetch_chapter_outline(
+        client.clone(),
+        base_website,
+        &ManGa_item {
+            name: manga.name.clone(),
+            path_word: path_word.to_string(),
+            cover: String::new(),
+            author: Vec::new(),
+        },
+        cancelled,
+    )
+    .await?;
+
+    let Some(online) = online else {
+        println!("⚠ 已取消，停止检查更新");
+        return Ok(None);
+    };
+
+    // 无论有没有新章节，都把线上章节详情落盘，保证每个漫画文件夹里都有 <漫画名>.json
+    // （顺带把 path_word 缓存进去，下次检查就不必再联网反查）。
+    if let Err(e) = save_chapter_details(&online).await {
+        eprintln!("[!] 保存 {} 的章节详情失败: {}", manga.name, e);
+    }
+
+    let local_chapter_names = manga
+        .chapter_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    let new_chapters = online
+        .chapters
+        .iter()
+        .filter(|chapter| !local_chapter_names.contains(chapter.chapter_name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !new_chapters.is_empty() {
+        println!("{} 发现 {} 个新章节:", manga.name, new_chapters.len());
+        for (index, chapter) in new_chapters.iter().enumerate() {
+            println!("  {}.{}", index + 1, chapter.chapter_name);
+        }
+        Ok(Some(MangaUpdate {
+            name: manga.name.clone(),
+            path_word: path_word.to_string(),
+            online_chapters: online.chapters.clone(),
+            new_chapters,
+        }))
+    } else {
+        println!("{} 没有更新", manga.name);
+        Ok(None)
+    }
+}
+
+/// 检查指定的一部本地漫画是否有更新。
+pub async fn check_manga_update(
+    client: Client,
+    base_website: &str,
+    manga: &LocalManga,
+    cancelled: &AtomicBool,
+) -> Result<Option<MangaUpdate>, Box<dyn Error>> {
+    check_single_manga_update(client, base_website, manga, cancelled).await
+}
+
 /// 对比本地章节目录和线上章节目录，返回每部漫画新增的章节。
 pub async fn check_manga_updates(
     client: Client,
@@ -786,78 +946,13 @@ pub async fn check_manga_updates(
             return Ok(Vec::new());
         }
 
-        println!("正在检查: {}", manga.name);
-
-        // 新版下载会在漫画文件夹里留下 <漫画名>.json，里面已缓存 path_word，直接用即可；
-        // 只有旧版下载没有该 JSON 时，才联网用名称反查 path_word。
-        let path_word = match manga.path_word.clone() {
-            Some(path_word) => {
-                println!("使用本地记录的漫画 ID: {}", path_word);
-                path_word
-            }
+        match check_single_manga_update(client.clone(), base_website, manga, cancelled).await? {
+            Some(update) => updates.push(update),
             None => {
-                println!("本地缺少漫画 ID，正在联网查找 {} ...", manga.name);
-                let Some(found) =
-                    find_path_word_by_name(client.clone(), base_website, &manga.name, cancelled)
-                        .await?
-                else {
-                    println!("[!] {} 没有找到精确匹配的线上漫画，已跳过", manga.name);
-                    continue;
-                };
-                found
+                if cancelled.load(Ordering::SeqCst) {
+                    return Ok(Vec::new());
+                }
             }
-        };
-
-        let online = fetch_chapter_outline(
-            client.clone(),
-            base_website,
-            &ManGa_item {
-                name: manga.name.clone(),
-                path_word: path_word.to_string(),
-                cover: String::new(),
-                author: Vec::new(),
-            },
-            cancelled,
-        )
-        .await?;
-
-        let Some(online) = online else {
-            println!("⚠ 已取消，停止检查更新");
-            return Ok(Vec::new());
-        };
-
-        // 无论有没有新章节，都把线上章节详情落盘，保证每个漫画文件夹里都有 <漫画名>.json
-        // （顺带把 path_word 缓存进去，下次检查就不必再联网反查）。
-        if let Err(e) = save_chapter_details(&online).await {
-            eprintln!("[!] 保存 {} 的章节详情失败: {}", manga.name, e);
-        }
-
-        let local_chapter_names = manga.chapter_names.iter().map(String::as_str).collect::<HashSet<_>>();
-
-        let new_chapters = online
-            .chapters
-            .iter()
-            .filter(|chapter| !local_chapter_names.contains(chapter.chapter_name.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if !new_chapters.is_empty() {
-            println!(
-                "{} 发现 {} 个新章节:",
-                manga.name,
-                new_chapters.len()
-            );
-            for (index, chapter) in new_chapters.iter().enumerate() {
-                println!("  {}.{}", index + 1, chapter.chapter_name);
-            }
-            updates.push(MangaUpdate {
-                name: manga.name.clone(),
-                path_word: path_word.to_string(),
-                online_chapters: online.chapters.clone(),
-                new_chapters,
-            });
-        } else {
-            println!("{} 没有更新", manga.name);
         }
 
         // 每部漫画之间歇一下，避免连续请求触发站点限流
@@ -867,9 +962,9 @@ pub async fn check_manga_updates(
     Ok(updates)
 }
 
-/// 让用户选择要更新的漫画，并下载这些漫画的新章节。
+/// 让用户选择要更新的漫画，并直接下载选中漫画的全部新章节。
 pub async fn update_selected_mangas(
-    mut updates: Vec<MangaUpdate>,
+    updates: Vec<MangaUpdate>,
     client: Client,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
@@ -878,80 +973,69 @@ pub async fn update_selected_mangas(
         return Ok(());
     }
 
-    println!("\n可更新的漫画:");
-    for (index, update) in updates.iter().enumerate() {
+    let choice = if updates.len() == 1 {
+        0
+    } else {
+        println!("\n可更新的漫画:");
+        for (index, update) in updates.iter().enumerate() {
+            println!(
+                "{}:{} (新增 {} 话)",
+                index,
+                update.name,
+                update.new_chapters.len()
+            );
+        }
         println!(
-            "{}:{} (新增 {} 话)",
-            index,
-            update.name,
-            update.new_chapters.len()
+            "输入 0-{0} 选择一部漫画，输入 {0} 以外的数字返回",
+            updates.len() - 1
         );
+
+        let Some(choice) = input_number("请输入要更新的漫画序号：", &cancelled).await else {
+            return Ok(());
+        };
+        if choice >= updates.len() {
+            println!("序号超出范围，返回主菜单...");
+            return Ok(());
+        }
+        choice
+    };
+
+    let update = &updates[choice];
+    if update.new_chapters.is_empty() {
+        println!("{} 没有新章节可下载", update.name);
+        return Ok(());
     }
-    println!("输入 0-{0} 选择一部漫画，输入 {0} 以外的数字返回", updates.len() - 1);
 
-    let Some(choice) = input_number("请输入要更新的漫画序号：", &cancelled).await else {
-        return Ok(());
-    };
-
-    let Some(update) = updates.get_mut(choice) else {
-        println!("序号超出范围，返回主菜单...");
-        return Ok(());
-    };
-
-    let new_count = update.new_chapters.len();
-    println!("即将下载 {} 的新章节：", update.name);
+    println!("即将下载 {} 的全部新章节:", update.name);
     for (index, chapter) in update.new_chapters.iter().enumerate() {
         println!("{}:{}", index + 1, chapter.chapter_name);
     }
 
-    let (begin, end) = loop {
-        let Some(begin) = input_number("请输入起始新章节序号(包含该话)：", &cancelled).await else {
-            return Ok(());
-        };
-        if begin < 1 || begin > new_count {
-            println!("起始范围错误，请重新输入");
-            continue;
-        }
-
-        let Some(end) = input_number("请输入结束新章节序号(包含该话)：", &cancelled).await else {
-            return Ok(());
-        };
-        if end < begin || end > new_count {
-            println!("结束范围错误，请重新输入");
-            continue;
-        }
-
-        break (begin - 1, end - 1);
-    };
-
     let manga_name = update.name.clone();
-    // 把整份新增章节列表交给 download，由它按 begin..=end 切片，
-    // 两个调用方共用同一套下标约定（0 基，含头含尾）。
+    // 新增章节从头下到尾，不再让用户选范围。
+    let begin = 0;
+    let end = update.new_chapters.len() - 1;
     let download_details = ChapterDetails {
         name: manga_name.clone(),
         path_word: update.path_word.clone(),
+        completed: false,
         chapters: update.new_chapters.clone(),
     };
 
     // 更新也要落盘 <漫画名>.json，把 path_word 缓存进漫画文件夹，
     // 这样下次检查更新就能直接读本地缓存，不必再联网反查。
     // 写入的是线上完整章节列表，避免用只含本次新增话的局部数据覆盖旧记录。
+    // completed 字段由 save_chapter_details 从已有文件保留。
     let snapshot = ChapterDetails {
         name: manga_name.clone(),
         path_word: update.path_word.clone(),
+        completed: false,
         chapters: update.online_chapters.clone(),
     };
     let json_path = save_chapter_details(&snapshot).await?;
     println!("章节详情已保存到: {}", json_path.display());
 
-    download(
-        download_details,
-        begin,
-        end,
-        client,
-        cancelled,
-    )
-    .await?;
+    download(download_details, begin, end, client, cancelled).await?;
 
     println!("{} 更新完成", manga_name);
     Ok(())

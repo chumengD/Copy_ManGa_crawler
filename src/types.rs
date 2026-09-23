@@ -64,6 +64,8 @@ impl fmt::Display for ErrorLog {
 pub struct ChapterDetails {
     pub name: String,
     pub path_word: String,
+    #[serde(default)]
+    pub completed: bool,
     pub chapters: Vec<ChapterContents>,
 }
 
@@ -80,6 +82,7 @@ pub struct ChapterContents {
 pub struct LocalManga {
     pub name: String,
     pub path_word: Option<String>,
+    pub completed: bool,
     pub chapter_names: Vec<String>,
 }
 
