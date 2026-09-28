@@ -5,24 +5,14 @@ use tokio::time::{sleep, Duration};
 
 use Copy_ManGa_downloader::types::ChapterDetails;
 use Copy_ManGa_downloader::{
-    BASE_WEBSITE, CopyMangaSource, MangaSource, check_manga_update, check_manga_updates,
-    display_chapter_list, download, input_line, input_number, pause_on_error,
-    read_manga_downloaded, save_chapter_details, set_manga_completed, update_selected_mangas,
+    BASE_WEBSITE, CopyMangaSource, MangaSource, ZerobywSource, check_manga_update,
+    check_manga_updates, display_chapter_list, download, input_line, input_number,
+    pause_on_error, read_manga_downloaded, save_chapter_details, set_manga_completed,
+    update_selected_mangas,
 };
 
 #[tokio::main]
 async fn main(){
-    let source = match CopyMangaSource::new(BASE_WEBSITE) {
-        Ok(c) => Arc::new(c) as Arc<dyn MangaSource>,
-        Err(e) => {
-            eprintln!("\n==============================");
-            eprintln!("程序发生错误，已停止运行：");
-            eprintln!("{}", e);
-            eprintln!("==============================");
-            pause_on_error();
-            return;
-        }
-    };
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_count:Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
@@ -38,6 +28,33 @@ async fn main(){
             println!("⚠ 下一次按 Ctrl+C 将直接退出程序...\n\n");
        }
    });
+
+    // 启动时选择漫画源：之后所有搜索/下载/更新检查都走选定的适配器
+    let source: Arc<dyn MangaSource> = match input_number("选择漫画源：1:拷贝漫画  2:zerobyw搬运网\n", &cancelled).await {
+        Some(2) => match ZerobywSource::new() {
+            Ok(s) => Arc::new(s) as Arc<dyn MangaSource>,
+            Err(e) => {
+                eprintln!("\n==============================");
+                eprintln!("程序发生错误，已停止运行：");
+                eprintln!("{}", e);
+                eprintln!("==============================");
+                pause_on_error();
+                return;
+            }
+        },
+        _ => match CopyMangaSource::new(BASE_WEBSITE) {
+            Ok(c) => Arc::new(c) as Arc<dyn MangaSource>,
+            Err(e) => {
+                eprintln!("\n==============================");
+                eprintln!("程序发生错误，已停止运行：");
+                eprintln!("{}", e);
+                eprintln!("==============================");
+                pause_on_error();
+                return;
+            }
+        },
+    };
+
    'outer: loop{
        cancelled.store(false, Ordering::SeqCst);
         if cancelled_count.load(Ordering::SeqCst) >=2{

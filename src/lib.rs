@@ -6,9 +6,11 @@
 pub mod copymanga;
 pub mod source;
 pub mod types;
+pub mod zerobyw;
 
 pub use copymanga::{BASE_WEBSITE, CopyMangaSource};
 pub use source::MangaSource;
+pub use zerobyw::ZerobywSource;
 
 use std::collections::HashSet;
 use std::error::Error;
