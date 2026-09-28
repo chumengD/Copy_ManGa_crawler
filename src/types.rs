@@ -66,6 +66,9 @@ pub struct ChapterDetails {
     pub path_word: String,
     #[serde(default)]
     pub completed: bool,
+    /// 漫画来源站标识（copymanga / zerobyw ...）；旧版 JSON 无此字段，读入时为空串
+    #[serde(default)]
+    pub source: String,
     pub chapters: Vec<ChapterContents>,
 }
 
@@ -83,6 +86,8 @@ pub struct LocalManga {
     pub name: String,
     pub path_word: Option<String>,
     pub completed: bool,
+    /// 漫画所属源；旧版下载的 JSON 没有该字段时为 None
+    pub source: Option<String>,
     pub chapter_names: Vec<String>,
 }
 
@@ -90,6 +95,7 @@ pub struct LocalManga {
 pub struct MangaUpdate {
     pub name: String,
     pub path_word: String,
+    pub source: String,
     pub online_chapters: Vec<ChapterContents>,
     pub new_chapters: Vec<ChapterContents>,
 }

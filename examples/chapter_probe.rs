@@ -1,55 +1,37 @@
-use Copy_ManGa_downloader::{fetch_chapter_contents, fetch_chapter_outline, get_client, types::ManGa_item};
+use Copy_ManGa_downloader::{BASE_WEBSITE, CopyMangaSource, MangaSource};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
+/// 探测拷贝漫画的章节大纲与图片直链解析是否正常
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let base = "https://ios.copymanga.club";
     let path_word = "miaobukeyan";
-    let client = get_client(base)?;
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let source = CopyMangaSource::new(BASE_WEBSITE)?;
+    let cancelled = AtomicBool::new(false);
 
-    let manga = ManGa_item {
-        name: path_word.to_string(),
-        path_word: path_word.to_string(),
-        cover: String::new(),
-        author: Vec::new(),
-    };
-    let payload = fetch_chapter_outline(client.clone(), base, &manga, &cancelled)
-        .await?
-        .ok_or("被取消")?;
+    let chapters = source.fetch_chapters(path_word, &cancelled).await?;
+    if chapters.is_empty() {
+        return Err("未获取到章节（可能被取消或被站点软限流）".into());
+    }
 
-    println!(
-        "== {} ({}) 共 {} 章",
-        payload.name,
-        payload.path_word,
-        payload.chapters.len()
-    );
-    for chapter in payload.chapters.iter().take(10) {
+    println!("== {} 共 {} 章", path_word, chapters.len());
+    for chapter in chapters.iter().take(10) {
         println!(
             "  {}  {}/comic/{}/chapter/{}",
-            chapter.chapter_name, base, payload.path_word, chapter.chapter_uuid
+            chapter.chapter_name, BASE_WEBSITE, path_word, chapter.chapter_uuid
         );
     }
 
-    if let Some(first) = payload.chapters.first() {
-        let contents = fetch_chapter_contents(
-            client.clone(),
-            base,
-            &payload.path_word,
-            &first.chapter_uuid,
-            &first.chapter_name,
-            &cancelled,
-        )
-        .await?
-        .ok_or("被取消")?;
+    if let Some(first) = chapters.first() {
+        let pages = source
+            .fetch_pages(path_word, &first.chapter_uuid, &cancelled)
+            .await?;
 
         println!(
             "\n== {} 的图片直链（共 {} 页）",
-            contents.chapter_name,
-            contents.pages_url.len()
+            first.chapter_name,
+            pages.len()
         );
-        for page in contents.pages_url.iter().take(5) {
+        for page in pages.iter().take(5) {
             println!("  {}", page);
         }
     }

@@ -1,320 +1,35 @@
-#![allow(unused_variables)]
-use anyhow::Result;
-use reqwest::Client;
-use reqwest::header::{HeaderMap, REFERER};
+//! 漫画下载器主流程：菜单交互、图片下载、本地状态管理与更新检查。
+//!
+//! 各站点的搜索/章节/图片解析逻辑由 [`source::MangaSource`] 适配器实现
+//! （见 [`copymanga`]），主流程只面向该接口，新增站点无需改动这里。
 
-use serde_json::{Value, json};
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+pub mod copymanga;
+pub mod source;
+pub mod types;
 
-use std::error::Error;
+pub use copymanga::{BASE_WEBSITE, CopyMangaSource};
+pub use source::MangaSource;
+
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::error::Error;
 use std::io::Write;
-use std::print;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::time::{sleep, Duration, timeout};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // read_line 供 input_line()，write_all 供 download()
-use tokio::fs::{create_dir_all, read_dir, read_to_string, write};
-use tokio::sync::Semaphore;
-
+use anyhow::{Context, Result};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Client;
+use tokio::fs::{create_dir_all, read_dir, read_to_string, write};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // read_line 供 input_line()，write_all 供 download()
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, sleep, timeout};
 
+use types::{ChapterDetails, LocalManga, MangaUpdate};
 
-pub mod types;
-use types::{ChapterContents, ChapterDetails, LocalManga, ManGa_item, MangaUpdate, Response};
-
-use regex::Regex;
-use anyhow::{anyhow, bail, Context};
-
-/// 站点地址直接硬编码，不再依赖外部 config.toml
-pub const BASE_WEBSITE: &str = "https://ios.copymanga.club";
-
-/// 相邻网络请求之间的最小间隔，避免请求过快触发站点限流（Too Many Requests）
-const REQUEST_DELAY: Duration = Duration::from_millis(1000);
-
-
-
-// pub async fn search_manga_chapters(client: Client,base_website: &str,cancelled: &AtomicBool)->{
-
-// }
-
-pub async fn search(
-    client: Client,
-    base_website: &str,
-    cancelled: &AtomicBool,
-) -> Result<Option<Response>, Box<dyn Error>> {
-    // 输入关键词期间按了 Ctrl+C（返回 Ok(None)）或 stdin 关闭（返回 Err）都放弃本次搜索
-    let Some(key_word) = input_line("输入关键词：\n", cancelled).await else {
-        return Ok(None);
-    };
-    // let key_word = String::from("19");
-    let base_url = format!("{}/api/kb/web/searchci/comics", &base_website);
-    let params = [
-        ("offset", "0"),
-        ("platform", "2"),
-        ("limit", "12"),
-        ("q", &key_word),
-        ("q_type", ""),
-    ];
-
-let mut response: Option<reqwest::Response> = None;
-
-for _ in 0..5 {
-    // 重试期间按了 Ctrl+C：放弃本次搜索
-    if cancelled.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-    match client.get(&base_url).query(&params).send().await {
-        Ok(res) => {
-            if res.status().is_success() {
-                response = Some(res);
-                break;
-            } else {
-                println!("搜索请求失败，状态码: {}，正在重试...", res.status());
-            }
-        }
-        Err(e) => {
-            println!("搜索请求发生错误: {}, 正在重试...", e);
-        }
-    }
-    // 请求之间歇一下，避免过快触发站点限流
-    sleep(REQUEST_DELAY).await;
-}
-    // let response = client.get(base_url).query(&params).send().await.expect("搜索失败1");
-    // let response1 = client.get("https://ios.copymanga.club/search?q=1&q_type=").send().await.expect("搜索失败1");
-    //dbg!(&response);
-
-    let Some(response) = response else {
-        return Err("搜索失败：重试 5 次后仍然没有成功响应".into());
-    };
-    let resp_text = response.text().await?;
-    //dbg!(&resp_text);
-    let resp_json: Response = serde_json::from_str(&resp_text)?;
-    //dbg!(format!("\n\n\n resp_json= {}\n\n\n",&resp_json));
-
-    println!("reponse：{:#?}", resp_json);
-
-    println!("以下为搜索结果(仅列举至多12项)：");
-    let lists = &resp_json.results.list;
-    for (index, item) in lists.iter().enumerate() {
-        println!("{}.{}", index, item.name);
-    }
-    Ok(Some(resp_json))
-}
-
-/// 根据 path_word 或完整漫画页 URL 获取解密后的章节列表详情。
-/// 返回 None 表示等待请求期间被取消。
-pub async fn fetch_chapter_outline(
-    client: Client,
-    base_website: &str,
-    manga: &ManGa_item,
-    cancelled: &AtomicBool,
-) -> Result<Option<ChapterDetails>, Box<dyn Error>> {
-    let base_website = base_website.trim_end_matches('/');
-    let path_word = manga.path_word.trim().trim_start_matches('/');
-    let page_url = format!("{base_website}/comic/{path_word}");
-
-    let mut html: Option<String> = None;
-    for _ in 0..5 {
-        if cancelled.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-
-        match client.get(&page_url).send().await {
-            Ok(response) if response.status().is_success() => {
-                html = Some(response.text().await?);
-                break;
-            }
-            Ok(response) => {
-                println!("漫画详情页请求失败，状态码: {}，正在重试...", response.status());
-            }
-            Err(e) => {
-                println!("漫画详情页请求发生错误: {e}，正在重试...");
-            }
-        }
-
-        sleep(Duration::from_secs(2)).await;
-    }
-    let Some(html) = html else {
-        return Err("漫画详情页请求失败：重试 5 次后仍然没有成功响应".into());
-    };
-    let (key, dnts) = extract_page_secrets(&html)?;
-    // dbg!(format!("\n\n\n key= {}\n dnts= {}\n\n\n",&key,&dnts));
-
-    // 连续请求详情页与章节接口之间歇一下
-    sleep(REQUEST_DELAY).await;
-
-    let api_url = format!("{base_website}/comicdetail/{path_word}/chapters");
-    let headers = [("dnts", dnts.as_str()), ("Referer", page_url.as_str())];
-    let mut body: Option<String> = None;
-    for _ in 0..5 {
-        if cancelled.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-
-        let mut request = client.get(&api_url);
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-
-        match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                body = Some(response.text().await?);
-                break;
-            }
-            Ok(response) => {
-                println!("章节接口请求失败，状态码: {}，正在重试...", response.status());
-            }
-            Err(e) => {
-                println!("章节接口请求发生错误: {e}，正在重试...");
-            }
-        }
-
-        sleep(Duration::from_secs(2)).await;
-    }
-    let Some(body) = body else {
-        return Err("章节接口请求失败：重试 5 次后仍然没有成功响应".into());
-    };
-
-    let body_json: Value = serde_json::from_str(&body)
-        .with_context(|| format!("章节接口返回不是合法 JSON: {body}"))?;
-    if body_json.get("code").and_then(Value::as_i64) != Some(200) {
-        return Err(anyhow!("章节接口返回异常: {body_json}").into());
-    }
-
-    let results = body_json
-        .get("results")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("章节接口返回缺少 results 字段"))?;
-    let payload = decrypt_results(results, &key)?;
-
-    let total = payload["groups"]
-        .as_object()
-        .map(|groups| {
-            groups
-                .values()
-                .filter_map(|group| group["chapters"].as_array())
-                .map(|chapters| chapters.len())
-                .sum()
-        })
-        .unwrap_or(0);
-    if total == 0 {
-        eprintln!(
-            "[!] 接口正常但返回空章节列表 —— 当前出口 IP 大概率被站点软限流，可稍后重试或更换出口 IP。"
-        );
-    }
-
-    Ok(Some(ChapterDetails {
-        name: manga.name.clone(),
-        path_word: path_word.to_string(),
-        completed: false,
-        chapters: extract_chapter_contents(&payload),
-    }))
-}
-
-/// 获取某一话的图片直链：章节页 HTML 里带中 AES 密钥 `cct` 和加密内容 `contentKey`，
-/// 解密后是一个 `[{ "url": "..." }, ...]` 数组。
-pub async fn fetch_chapter_contents(
-    client: Client,
-    base_website: &str,
-    path_word: &str,
-    uuid: &str,
-    chapter_name: &str,
-    cancelled: &AtomicBool,
-) -> Result<Option<ChapterContents>, Box<dyn Error>> {
-    let base_website = base_website.trim_end_matches('/');
-    let path_word = path_word.trim().trim_start_matches('/');
-    let uuid = uuid.trim();
-    let page_url = format!("{base_website}/comic/{path_word}/chapter/{uuid}");
-
-    let mut html: Option<String> = None;
-    for _ in 0..5 {
-        if cancelled.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-
-        match client.get(&page_url).send().await {
-            Ok(response) if response.status().is_success() => {
-                html = Some(response.text().await?);
-                break;
-            }
-            Ok(response) => {
-                println!("章节目录页请求失败，状态码: {}，正在重试...", response.status());
-            }
-            Err(e) => {
-                println!("章节目录页请求发生错误: {e}，正在重试...");
-            }
-        }
-
-        sleep(Duration::from_secs(2)).await;
-    }
-
-    let Some(html) = html else {
-        return Err("章节目录页请求失败：重试 5 次后仍然没有成功响应".into());
-    };
-
-    let (cct, content_key) = extract_chapter_secrets(&html)?;
-    let pages_url: Vec<String> =
-        serde_json::from_value::<Vec<Value>>(decrypt_results(&content_key, &cct)?)?
-            .into_iter()
-            .filter_map(|page| {
-                page.get("url")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect();
-
-    Ok(Some(ChapterContents {
-        chapter_name: chapter_name.to_string(),
-        chapter_uuid: uuid.to_string(),
-        len: pages_url.len(),
-        pages_url,
-    }))
-}
-
-
-
-fn decrypt_results(results: &str, key: &str) -> Result<Value> {
-    let iv = results
-        .get(..16)
-        .ok_or_else(|| anyhow!("results 长度不足 16 字符，无法取出 IV"))?
-        .as_bytes();
-    let hex_ct = results
-        .get(16..)
-        .ok_or_else(|| anyhow!("results 缺少密文部分"))?;
-    let mut buf = hex::decode(hex_ct).context("章节密文 hex 解码失败")?;
-
-    if buf.is_empty() || buf.len() % 16 != 0 {
-        bail!("章节密文长度（{} 字节）不是 16 的倍数", buf.len());
-    }
-    let plaintext = Aes128CbcDec::new_from_slices(key.as_bytes(), iv)
-        .map_err(|_| anyhow!("AES-128 密钥/IV 长度错误"))?
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|_| anyhow!("PKCS7 padding 校验失败（密钥可能不对）"))?;
-
-    serde_json::from_slice(plaintext).context("解密结果不是合法 JSON")
-}
-
-
-
-pub fn get_client(base_website: &str)-> Result<Client, Box<dyn Error>> {
-     //初始化client
-    let mut headers = HeaderMap::new();
-    headers.insert(REFERER, base_website.parse().unwrap());
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-        .danger_accept_invalid_certs(true)
-        .default_headers(headers)
-        .build()?;
-    Ok(client)
-}
-
-
-
+/// 检查全部更新时，相邻两部漫画之间的间隔，避免连续请求触发站点限流
+const BETWEEN_MANGA_DELAY: Duration = Duration::from_millis(1000);
 
 /// 等待一行输入；等待期间 cancelled 被置位（Ctrl+C）立即返回 None。
 /// 不依赖任何全局状态：每次提示现场读取一行，读行 future 随 select 一起被丢弃，
@@ -369,35 +84,19 @@ pub async fn input_number(prompt: &str, cancelled: &AtomicBool) -> Option<usize>
     }
 }
 
+fn sanitize_file_name(value: &str) -> String {
+    let stem = value
+        .trim()
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
 
-fn extract_page_secrets(html: &str) -> Result<(String, String)> {
-    let ccz_re = Regex::new(r"var\s+ccz\s*=\s*'([^']+)'").unwrap();
-    let dnt_re = Regex::new(r#"id="dnt"[^>]*value="([^"]*)""#).unwrap();
-    let key = ccz_re
-        .captures(html)
-        .map(|c| c[1].to_string())
-        .ok_or_else(|| anyhow!("页面中未找到 AES 密钥 ccz（站点可能已更新加密方案）"))?;
-    let dnts = dnt_re
-        .captures(html)
-        .map(|c| c[1].to_string())
-        .unwrap_or_else(|| "3".to_string());
-    Ok((key, dnts))
-}
-
-fn extract_chapter_secrets(html: &str) -> Result<(String, String)> {
-    let cct_re = Regex::new(r"var\s+cct\s*=\s*'([^']+)'").unwrap();
-    let content_key_re = Regex::new(r"var\s+contentKey\s*=\s*'([^']+)'").unwrap();
-
-    let cct = cct_re
-        .captures(html)
-        .map(|c| c[1].to_string())
-        .ok_or_else(|| anyhow!("阅读页中未找到 AES 密钥 cct（站点可能已更新加密方案）"))?;
-    let content_key = content_key_re
-        .captures(html)
-        .map(|c| c[1].to_string())
-        .ok_or_else(|| anyhow!("阅读页中未找到 contentKey"))?;
-
-    Ok((cct, content_key))
+    if stem.is_empty() {
+        "chapter_details".to_string()
+    } else {
+        stem
+    }
 }
 
 pub async fn save_chapter_details(
@@ -418,11 +117,15 @@ pub async fn save_chapter_details(
         .await
         .with_context(|| format!("创建目录失败: {}", output_dir.display()))?;
 
-    // 落盘时保留已有的完结标记，避免检查/更新章节时把用户手动标记的完结状态冲掉。
+    // 落盘时保留已有的完结标记与来源标识，避免检查/更新章节时
+    // 把用户手动标记的完结状态或漫画所属源冲掉。
     let mut details = details.clone();
     if let Ok(text) = read_to_string(&output_path).await {
         if let Ok(existing) = serde_json::from_str::<ChapterDetails>(&text) {
             details.completed = existing.completed;
+            if !existing.source.is_empty() {
+                details.source = existing.source;
+            }
         }
     }
 
@@ -457,6 +160,7 @@ pub async fn set_manga_completed(manga_name: &str, completed: bool) -> Result<Pa
             name: manga_name.to_string(),
             path_word: String::new(),
             completed: false,
+            source: String::new(),
             chapters: Vec::new(),
         },
     };
@@ -489,7 +193,7 @@ pub async fn download(
         if cancelled.load(Ordering::SeqCst) {
             break;
         }
-        
+
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         //创建漫画文件夹
@@ -648,54 +352,6 @@ pub async fn download(
     Ok(())
 }
 
-fn extract_chapter_contents(details: &Value) -> Vec<ChapterContents> {
-    let mut chapters = Vec::new();
-
-    let Some(groups) = details.get("groups").and_then(Value::as_object) else {
-        return chapters;
-    };
-
-    for group in groups.values() {
-        let Some(group_chapters) = group.get("chapters").and_then(Value::as_array) else {
-            continue;
-        };
-
-        for chapter in group_chapters {
-            let Some(name) = chapter.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(uuid) = chapter.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-
-            chapters.push(ChapterContents {
-                chapter_name: name.to_string(),
-                chapter_uuid: uuid.to_string(),
-                len: 0,
-                pages_url: Vec::new(),
-            });
-        }
-    }
-
-    chapters
-}
-
-fn sanitize_file_name(value: &str) -> String {
-    let stem = value
-        .trim()
-        .trim_start_matches('/')
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect::<String>();
-
-    if stem.is_empty() {
-        "chapter_details".to_string()
-    } else {
-        stem
-    }
-}
-
-
 pub fn display_chapter_list(chapters:&ChapterDetails){
      for (index,content)in chapters.chapters.iter().enumerate() {
                 println!("{}:{}",index+1,content.chapter_name);
@@ -712,7 +368,7 @@ pub fn pause_on_error() {
 }
 
 /// 扫描 download 目录。一级文件夹是漫画名，其下的子文件夹代表已下载章节。
-/// 章节详情 JSON 只用来补充 path_word，不作为“是否下载过”的依据。
+/// 章节详情 JSON 只用来补充 path_word / source / completed，不作为“是否下载过”的依据。
 pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> {
     let download_dir = Path::new("download");
     if !download_dir.exists() {
@@ -745,11 +401,12 @@ pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> 
             }
         }
 
-        let (path_word, completed) = read_local_meta(&path, name).await;
+        let (path_word, completed, source) = read_local_meta(&path, name).await;
         mangas.push(LocalManga {
             name: name.to_string(),
             path_word,
             completed,
+            source,
             chapter_names,
         });
     }
@@ -757,15 +414,15 @@ pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> 
     Ok(mangas)
 }
 
-/// 从本地 `<漫画名>.json` 里读出 path_word 和完结标记。
-/// 文件不存在或格式不兼容时返回 `(None, false)`，由调用方决定是否兜底。
-async fn read_local_meta(manga_dir: &Path, name: &str) -> (Option<String>, bool) {
+/// 从本地 `<漫画名>.json` 里读出 path_word、完结标记和来源源标识。
+/// 文件不存在或格式不兼容时返回 `(None, false, None)`，由调用方决定是否兜底。
+async fn read_local_meta(manga_dir: &Path, name: &str) -> (Option<String>, bool, Option<String>) {
     let metadata_path = manga_dir.join(format!("{}.json", sanitize_file_name(name)));
     let Ok(text) = read_to_string(metadata_path).await else {
-        return (None, false);
+        return (None, false, None);
     };
     let Ok(details) = serde_json::from_str::<ChapterDetails>(&text) else {
-        return (None, false);
+        return (None, false, None);
     };
 
     let path_word = {
@@ -776,59 +433,21 @@ async fn read_local_meta(manga_dir: &Path, name: &str) -> (Option<String>, bool)
             Some(path_word.to_string())
         }
     };
-    (path_word, details.completed)
-}
-
-async fn find_path_word_by_name(
-    client: Client,
-    base_website: &str,
-    name: &str,
-    cancelled: &AtomicBool,
-) -> Result<Option<String>, Box<dyn Error>> {
-    let url = format!("{}/api/kb/web/searchci/comics", base_website.trim_end_matches('/'));
-    let params = [
-        ("offset", "0"),
-        ("platform", "2"),
-        ("limit", "20"),
-        ("q", name),
-        ("q_type", ""),
-    ];
-
-    for _ in 0..3 {
-        if cancelled.load(Ordering::SeqCst) {
-            return Ok(None);
+    let source = {
+        let source = details.source.trim();
+        if source.is_empty() {
+            None
+        } else {
+            Some(source.to_string())
         }
-
-        match client.get(&url).query(&params).send().await {
-            Ok(response) if response.status().is_success() => {
-                let text = response.text().await?;
-                let result: Response = serde_json::from_str(&text)?;
-                return Ok(result
-                    .results
-                    .list
-                    .into_iter()
-                    .find(|item| item.name == name)
-                    .map(|item| item.path_word));
-            }
-            Ok(response) => {
-                println!("搜索漫画 ID 失败，状态码: {}，正在重试...", response.status());
-            }
-            Err(e) => {
-                println!("搜索漫画 ID 发生错误: {e}，正在重试...");
-            }
-        }
-
-        sleep(Duration::from_secs(2)).await;
-    }
-
-    Err("搜索漫画 ID 失败：重试 3 次后仍然没有成功响应".into())
+    };
+    (path_word, details.completed, source)
 }
 
 /// 检查单部漫画的更新。
-/// 返回 `Ok(Some(update))` 表示有新章节；`Ok(None)` 表示无更新、被跳过或已取消。
+/// 返回 `Ok(Some(update))` 表示有新章节；`Ok(None)` 表示无更新、属于其他源、被跳过或已取消。
 async fn check_single_manga_update(
-    client: Client,
-    base_website: &str,
+    source: &dyn MangaSource,
     manga: &LocalManga,
     cancelled: &AtomicBool,
 ) -> Result<Option<MangaUpdate>, Box<dyn Error>> {
@@ -841,10 +460,22 @@ async fn check_single_manga_update(
         return Ok(None);
     }
 
+    // 旧版下载的 JSON 里没有 source 字段，按当前源处理（向后兼容）；
+    // 有 source 但与当前源不符的漫画跳过，避免拿错站点的 ID 去请求。
+    if let Some(manga_source) = &manga.source {
+        if manga_source != source.id() {
+            println!(
+                "{} 属于源 {}，当前源为 {}，跳过检查更新",
+                manga.name, manga_source, source.id()
+            );
+            return Ok(None);
+        }
+    }
+
     println!("正在检查: {}", manga.name);
 
-    // 新版下载会在漫画文件夹里留下 <漫画名>.json，里面已缓存 path_word，直接用即可；
-    // 只有旧版下载没有该 JSON 时，才联网用名称反查 path_word。
+    // 新版下载会在漫画文件夹里留下 <漫画名>.json，里面已缓存漫画 ID，直接用即可；
+    // 只有旧版下载没有该 JSON 时，才联网用名称反查漫画 ID。
     let path_word = match manga.path_word.clone() {
         Some(path_word) => {
             println!("使用本地记录的漫画 ID: {}", path_word);
@@ -852,9 +483,7 @@ async fn check_single_manga_update(
         }
         None => {
             println!("本地缺少漫画 ID，正在联网查找 {} ...", manga.name);
-            let Some(found) =
-                find_path_word_by_name(client.clone(), base_website, &manga.name, cancelled).await?
-            else {
+            let Some(found) = source.find_by_name(&manga.name, cancelled).await? else {
                 if cancelled.load(Ordering::SeqCst) {
                     return Ok(None);
                 }
@@ -865,26 +494,21 @@ async fn check_single_manga_update(
         }
     };
 
-    let online = fetch_chapter_outline(
-        client.clone(),
-        base_website,
-        &ManGa_item {
-            name: manga.name.clone(),
-            path_word: path_word.to_string(),
-            cover: String::new(),
-            author: Vec::new(),
-        },
-        cancelled,
-    )
-    .await?;
-
-    let Some(online) = online else {
+    let chapters = source.fetch_chapters(&path_word, cancelled).await?;
+    if cancelled.load(Ordering::SeqCst) {
         println!("⚠ 已取消，停止检查更新");
         return Ok(None);
-    };
+    }
 
     // 无论有没有新章节，都把线上章节详情落盘，保证每个漫画文件夹里都有 <漫画名>.json
-    // （顺带把 path_word 缓存进去，下次检查就不必再联网反查）。
+    // （顺带把漫画 ID 缓存进去，下次检查就不必再联网反查）。
+    let online = ChapterDetails {
+        name: manga.name.clone(),
+        path_word: path_word.clone(),
+        completed: false,
+        source: source.id().to_string(),
+        chapters: chapters.clone(),
+    };
     if let Err(e) = save_chapter_details(&online).await {
         eprintln!("[!] 保存 {} 的章节详情失败: {}", manga.name, e);
     }
@@ -909,8 +533,9 @@ async fn check_single_manga_update(
         }
         Ok(Some(MangaUpdate {
             name: manga.name.clone(),
-            path_word: path_word.to_string(),
-            online_chapters: online.chapters.clone(),
+            path_word,
+            source: source.id().to_string(),
+            online_chapters: online.chapters,
             new_chapters,
         }))
     } else {
@@ -921,18 +546,16 @@ async fn check_single_manga_update(
 
 /// 检查指定的一部本地漫画是否有更新。
 pub async fn check_manga_update(
-    client: Client,
-    base_website: &str,
+    source: &dyn MangaSource,
     manga: &LocalManga,
     cancelled: &AtomicBool,
 ) -> Result<Option<MangaUpdate>, Box<dyn Error>> {
-    check_single_manga_update(client, base_website, manga, cancelled).await
+    check_single_manga_update(source, manga, cancelled).await
 }
 
 /// 对比本地章节目录和线上章节目录，返回每部漫画新增的章节。
 pub async fn check_manga_updates(
-    client: Client,
-    base_website: &str,
+    source: &dyn MangaSource,
     cancelled: &AtomicBool,
 ) -> Result<Vec<MangaUpdate>, Box<dyn Error>> {
     let local_mangas = read_manga_downloaded().await?;
@@ -946,7 +569,7 @@ pub async fn check_manga_updates(
             return Ok(Vec::new());
         }
 
-        match check_single_manga_update(client.clone(), base_website, manga, cancelled).await? {
+        match check_single_manga_update(source, manga, cancelled).await? {
             Some(update) => updates.push(update),
             None => {
                 if cancelled.load(Ordering::SeqCst) {
@@ -956,7 +579,7 @@ pub async fn check_manga_updates(
         }
 
         // 每部漫画之间歇一下，避免连续请求触发站点限流
-        sleep(REQUEST_DELAY).await;
+        sleep(BETWEEN_MANGA_DELAY).await;
     }
 
     Ok(updates)
@@ -965,7 +588,7 @@ pub async fn check_manga_updates(
 /// 让用户选择要更新的漫画，并直接下载选中漫画的全部新章节。
 pub async fn update_selected_mangas(
     updates: Vec<MangaUpdate>,
-    client: Client,
+    source: Arc<dyn MangaSource>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     if updates.is_empty() {
@@ -1019,63 +642,26 @@ pub async fn update_selected_mangas(
         name: manga_name.clone(),
         path_word: update.path_word.clone(),
         completed: false,
+        source: update.source.clone(),
         chapters: update.new_chapters.clone(),
     };
 
-    // 更新也要落盘 <漫画名>.json，把 path_word 缓存进漫画文件夹，
+    // 更新也要落盘 <漫画名>.json，把漫画 ID 缓存进漫画文件夹，
     // 这样下次检查更新就能直接读本地缓存，不必再联网反查。
     // 写入的是线上完整章节列表，避免用只含本次新增话的局部数据覆盖旧记录。
-    // completed 字段由 save_chapter_details 从已有文件保留。
+    // completed / source 字段由 save_chapter_details 从已有文件保留。
     let snapshot = ChapterDetails {
         name: manga_name.clone(),
         path_word: update.path_word.clone(),
         completed: false,
+        source: update.source.clone(),
         chapters: update.online_chapters.clone(),
     };
     let json_path = save_chapter_details(&snapshot).await?;
     println!("章节详情已保存到: {}", json_path.display());
 
-    download(download_details, begin, end, client, cancelled).await?;
+    download(download_details, begin, end, source.http().clone(), cancelled).await?;
 
     println!("{} 更新完成", manga_name);
     Ok(())
 }
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extracts_chapter_name_and_uuid() {
-        let details = json!({
-            "groups": {
-                "default": {
-                    "chapters": [
-                        {"id": "uuid-01", "name": "第01话"},
-                        {"id": "uuid-02", "name": "第02话"}
-                    ]
-                }
-            }
-        });
-
-        let chapters = extract_chapter_contents(&details);
-
-        assert_eq!(chapters.len(), 2);
-        assert_eq!(chapters[0].chapter_name, "第01话");
-        assert_eq!(chapters[0].chapter_uuid, "uuid-01");
-        assert_eq!(chapters[1].chapter_uuid, "uuid-02");
-    }
-
-    #[test]
-    fn search_works() {
-        let client = get_client("https://ios.copymanga.club").unwrap();
-        let cancelled = AtomicBool::new(false);
-        let result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(search(client, "https://ios.copymanga.club", &cancelled));
-        assert!(result.is_ok());
-    }
-}
-
-
