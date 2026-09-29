@@ -28,7 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // read_line 供 input_line()�
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep, timeout};
 
-use types::{ChapterDetails, LocalManga, MangaUpdate};
+use types::{ChapterContents, ChapterDetails, LocalManga, MangaUpdate};
 
 /// 检查全部更新时，相邻两部漫画之间的间隔，避免连续请求触发站点限流
 const BETWEEN_MANGA_DELAY: Duration = Duration::from_millis(1000);
@@ -194,6 +194,13 @@ pub async fn download(
         // 已取消：不再派发本章剩余页面的下载任务
         if cancelled.load(Ordering::SeqCst) {
             break;
+        }
+
+        // 没有图片直链的章节直接跳过：正常流程不会出现，出现说明上游拉取直链失败，
+        // 跳过可避免建出空章节目录还提示"下载完毕"
+        if chapter.pages_url.is_empty() {
+            println!("{} 没有图片直链，跳过", chapter.chapter_name);
+            continue;
         }
 
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -371,6 +378,7 @@ pub fn pause_on_error() {
 
 /// 扫描 download 目录。一级文件夹是漫画名，其下的子文件夹代表已下载章节。
 /// 章节详情 JSON 只用来补充 path_word / source / completed，不作为“是否下载过”的依据。
+/// 空的章节目录不算已下载：更新中断会留下空目录，需要重新检测补下。
 pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> {
     let download_dir = Path::new("download");
     if !download_dir.exists() {
@@ -398,6 +406,11 @@ pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> 
             let child_path = child.path();
             if child_path.is_dir() {
                 if let Some(chapter_name) = child_path.file_name().and_then(|name| name.to_str()) {
+                    // 空目录不算已下载：更新中断会留下空章节目录，
+                    // 计入的话下次检查更新会误判为"没有更新"，永远补不上
+                    if is_empty_dir(&child_path).await {
+                        continue;
+                    }
                     chapter_names.push(chapter_name.to_string());
                 }
             }
@@ -414,6 +427,18 @@ pub async fn read_manga_downloaded() -> Result<Vec<LocalManga>, Box<dyn Error>> 
     }
 
     Ok(mangas)
+}
+
+/// 目录里一个条目都没有才算空；读取失败按非空处理（保持原有判定，不多打扰）
+async fn is_empty_dir(dir: &Path) -> bool {
+    match read_dir(dir).await {
+        Ok(mut entries) => entries
+            .next_entry()
+            .await
+            .map(|next| next.is_none())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// 从本地 `<漫画名>.json` 里读出 path_word、完结标记和来源源标识。
@@ -636,16 +661,51 @@ pub async fn update_selected_mangas(
         println!("{}:{}", index + 1, chapter.chapter_name);
     }
 
+    // 章节大纲接口只返回章节列表，不含图片直链；下载前必须逐话补齐，
+    // 否则 download() 拿到空 pages_url 会一个文件都不下。
+    // 拉取失败的话跳过并在结尾提示，下次检查更新会再次将其列为新章节。
+    let mut new_chapters = Vec::new();
+    for chapter in &update.new_chapters {
+        if cancelled.load(Ordering::SeqCst) {
+            println!("⚠ 已取消，停止更新");
+            return Ok(());
+        }
+
+        match source
+            .fetch_pages(&update.path_word, &chapter.chapter_uuid, &cancelled)
+            .await
+        {
+            Ok(pages_url) if !pages_url.is_empty() => {
+                new_chapters.push(ChapterContents {
+                    chapter_name: chapter.chapter_name.clone(),
+                    chapter_uuid: chapter.chapter_uuid.clone(),
+                    len: pages_url.len(),
+                    pages_url,
+                });
+            }
+            Ok(_) => eprintln!("[!] {} 没有获取到图片直链，已跳过", chapter.chapter_name),
+            Err(e) => eprintln!("[!] {} 获取图片直链失败，已跳过: {}", chapter.chapter_name, e),
+        }
+
+        // 每话之间歇一下，避免请求过快触发站点限流
+        sleep(BETWEEN_MANGA_DELAY).await;
+    }
+
+    if new_chapters.is_empty() {
+        println!("{} 的新章节全部拉取直链失败，本次不下载", update.name);
+        return Ok(());
+    }
+
     let manga_name = update.name.clone();
     // 新增章节从头下到尾，不再让用户选范围。
     let begin = 0;
-    let end = update.new_chapters.len() - 1;
+    let end = new_chapters.len() - 1;
     let download_details = ChapterDetails {
         name: manga_name.clone(),
         path_word: update.path_word.clone(),
         completed: false,
         source: update.source.clone(),
-        chapters: update.new_chapters.clone(),
+        chapters: new_chapters,
     };
 
     // 更新也要落盘 <漫画名>.json，把漫画 ID 缓存进漫画文件夹，
