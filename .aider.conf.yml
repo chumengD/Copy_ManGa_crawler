@@ -1,0 +1,3 @@
+# 禁止 aider 在提交信息中添加 AI 署名（Co-authored-by / 作者名后缀）
+attribute-author: false
+attribute-co-authored: false

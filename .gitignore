@@ -3,5 +3,6 @@
 /download
 
 .aider*
+!.aider.conf.yml
 
 .omc/
