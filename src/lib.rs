@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
@@ -25,7 +25,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use tokio::fs::{create_dir_all, read_dir, read_to_string, write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // read_line 供 input_line()，write_all 供 download()
-use tokio::sync::Semaphore;
+use tokio::io::{BufReader, Stdin};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{Duration, sleep, timeout};
 
 use types::{ChapterContents, ChapterDetails, LocalManga, MangaOutline, MangaUpdate};
@@ -33,22 +34,41 @@ use types::{ChapterContents, ChapterDetails, LocalManga, MangaOutline, MangaUpda
 /// 检查全部更新时，相邻两部漫画之间的间隔，避免连续请求触发站点限流
 const BETWEEN_MANGA_DELAY: Duration = Duration::from_millis(1000);
 
+/// 进程内共享的 stdin 读取器。必须在多次 input_line 之间复用同一个 BufReader：
+/// 每次新建会把管道里待读的多行一口气读进自己的缓冲区，用完即弃，导致后续输入丢失
+/// （交互时"预打"的输入、重定向/管道输入都会中招）。
+fn global_stdin() -> &'static Mutex<BufReader<Stdin>> {
+    static STDIN: OnceLock<Mutex<BufReader<Stdin>>> = OnceLock::new();
+    STDIN.get_or_init(|| Mutex::new(BufReader::new(tokio::io::stdin())))
+}
+
+/// stdin 是否已读到 EOF（管道关闭 / 输入流结束）。
+/// EOF 时 input_line 返回 None 与 Ctrl+C 取消无法从返回值区分，
+/// 调用方（主菜单）据此决定退出而不是当成"输入无效"死循环。
+pub fn stdin_at_eof() -> &'static AtomicBool {
+    static EOF: AtomicBool = AtomicBool::new(false);
+    &EOF
+}
+
 /// 等待一行输入；等待期间 cancelled 被置位（Ctrl+C）立即返回 None。
-/// 不依赖任何全局状态：每次提示现场读取一行，读行 future 随 select 一起被丢弃，
-/// 不存在"后台读线程泄漏 / 多个读者抢 stdin"的问题。
-/// 返回 None 表示被取消或 stdin 已关闭（EOF）。
+/// 全程持有全局 stdin 锁，读行 future 随 select 一起被丢弃时锁会自动释放，
+/// 不会出现"后台读线程泄漏 / 多个读者抢 stdin"的问题。
+/// 返回 None 表示被取消或 stdin 已关闭（EOF，见 stdin_at_eof）。
 pub async fn input_line(prompt: &str, cancelled: &AtomicBool) -> Option<String> {
     print!("{}", prompt);
     let _ = std::io::stdout().flush();
 
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut reader = global_stdin().lock().await;
     loop {
         let mut line = String::new();
         tokio::select! {
             // Ctrl+C：取消标志由调用方（bin 里的全局监听任务）置位
             _ = wait_cancelled(cancelled) => return None,
             res = reader.read_line(&mut line) => match res {
-                Ok(0) => return None, // EOF：stdin 已关闭
+                Ok(0) => {
+                    stdin_at_eof().store(true, Ordering::SeqCst);
+                    return None; // EOF：stdin 已关闭
+                }
                 Ok(_) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {

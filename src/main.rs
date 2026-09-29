@@ -9,7 +9,7 @@ use Copy_ManGa_downloader::{
     BASE_WEBSITE, CopyMangaSource, MangaSource, ZerobywSource, check_manga_updates,
     display_chapter_list, download, fetch_manga_outline, input_line, input_number,
     pause_on_error, read_manga_downloaded, save_chapter_details, set_manga_completed,
-    update_selected_mangas,
+    stdin_at_eof, update_selected_mangas,
 };
 
 #[tokio::main]
@@ -126,7 +126,12 @@ async fn main(){
                         }
                     }
 
-            None=> {
+            None => {
+                if stdin_at_eof().load(Ordering::SeqCst) {
+                    // stdin 关闭（管道结束/输入流断开）时退出，避免当"输入无效"死循环
+                    println!("输入已结束，退出程序.....");
+                    break 'outer;
+                }
                 println!("⚠ 输入无效，请重新输入");
                 continue 'outer;
             }
