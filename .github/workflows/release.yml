@@ -1,0 +1,77 @@
+name: Release
+
+# 推送 v 开头的 tag 时触发，例如: git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: [ 'v*' ]
+
+# 创建 Release 需要写 contents 权限
+permissions:
+  contents: write
+
+env:
+  BIN: Copy_ManGa_downloader
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          DIR="${BIN}-${TAG}-${{ matrix.target }}"
+          mkdir "$DIR"
+          cp "target/${{ matrix.target }}/release/$BIN" "$DIR/"
+          cp README.md "$DIR/"
+          tar czf "$DIR.tar.gz" "$DIR"
+          sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+          echo "ASSET=$DIR.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+          $dir = "$env:BIN-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory "$dir" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN.exe" "$dir/"
+          Copy-Item "README.md" "$dir/"
+          Compress-Archive -Path "$dir" -DestinationPath "$dir.zip"
+          (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower() + "  $dir.zip" |
+            Out-File -Encoding ascii "$dir.zip.sha256"
+          "ASSET=$dir.zip" | Add-Content $env:GITHUB_ENV
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
