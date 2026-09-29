@@ -100,6 +100,15 @@ pub struct MangaUpdate {
     pub new_chapters: Vec<ChapterContents>,
 }
 
+/// 指定漫画检查时拉到的线上章节信息（含落盘快照用的完整大纲）
+#[derive(Debug, Clone)]
+pub struct MangaOutline {
+    pub name: String,
+    pub path_word: String,
+    pub source: String,
+    pub online_chapters: Vec<ChapterContents>,
+}
+
 
 /// run() 的退出原因：正常完成一部漫画，还是被 Ctrl+C 取消
 pub enum RunOutcome {

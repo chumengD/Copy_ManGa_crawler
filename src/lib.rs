@@ -28,7 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt}; // read_line 供 input_line()�
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep, timeout};
 
-use types::{ChapterContents, ChapterDetails, LocalManga, MangaUpdate};
+use types::{ChapterContents, ChapterDetails, LocalManga, MangaOutline, MangaUpdate};
 
 /// 检查全部更新时，相邻两部漫画之间的间隔，避免连续请求触发站点限流
 const BETWEEN_MANGA_DELAY: Duration = Duration::from_millis(1000);
@@ -471,19 +471,15 @@ async fn read_local_meta(manga_dir: &Path, name: &str) -> (Option<String>, bool,
     (path_word, details.completed, source)
 }
 
-/// 检查单部漫画的更新。
-/// 返回 `Ok(Some(update))` 表示有新章节；`Ok(None)` 表示无更新、属于其他源、被跳过或已取消。
-async fn check_single_manga_update(
+/// 解析漫画 ID 并拉取线上章节大纲，顺带把快照落盘（缓存漫画 ID / source，保留完结标记）。
+/// 不判断完结与否——是否跳过由调用方决定。
+/// 返回 `Ok(None)` 表示被取消、漫画不属于当前源或没找到精确匹配（原因已打印）。
+pub async fn fetch_manga_outline(
     source: &dyn MangaSource,
     manga: &LocalManga,
     cancelled: &AtomicBool,
-) -> Result<Option<MangaUpdate>, Box<dyn Error>> {
+) -> Result<Option<MangaOutline>, Box<dyn Error>> {
     if cancelled.load(Ordering::SeqCst) {
-        return Ok(None);
-    }
-
-    if manga.completed {
-        println!("{} 已完结，跳过检查更新", manga.name);
         return Ok(None);
     }
 
@@ -492,7 +488,7 @@ async fn check_single_manga_update(
     if let Some(manga_source) = &manga.source {
         if manga_source != source.id() {
             println!(
-                "{} 属于源 {}，当前源为 {}，跳过检查更新",
+                "{} 属于源 {}，当前源为 {}，跳过",
                 manga.name, manga_source, source.id()
             );
             return Ok(None);
@@ -521,24 +517,54 @@ async fn check_single_manga_update(
         }
     };
 
-    let chapters = source.fetch_chapters(&path_word, cancelled).await?;
+    let online_chapters = source.fetch_chapters(&path_word, cancelled).await?;
     if cancelled.load(Ordering::SeqCst) {
         println!("⚠ 已取消，停止检查更新");
         return Ok(None);
     }
 
     // 无论有没有新章节，都把线上章节详情落盘，保证每个漫画文件夹里都有 <漫画名>.json
-    // （顺带把漫画 ID 缓存进去，下次检查就不必再联网反查）。
-    let online = ChapterDetails {
+    let snapshot = ChapterDetails {
         name: manga.name.clone(),
         path_word: path_word.clone(),
         completed: false,
         source: source.id().to_string(),
-        chapters: chapters.clone(),
+        chapters: online_chapters.clone(),
     };
-    if let Err(e) = save_chapter_details(&online).await {
+    if let Err(e) = save_chapter_details(&snapshot).await {
         eprintln!("[!] 保存 {} 的章节详情失败: {}", manga.name, e);
     }
+
+    Ok(Some(MangaOutline {
+        name: manga.name.clone(),
+        path_word,
+        source: source.id().to_string(),
+        online_chapters,
+    }))
+}
+
+/// 检查单部漫画的更新。
+/// 返回 `Ok(Some(update))` 表示有新章节；`Ok(None)` 表示无更新、已完结、属于其他源、被跳过或已取消。
+async fn check_single_manga_update(
+    source: &dyn MangaSource,
+    manga: &LocalManga,
+    cancelled: &AtomicBool,
+) -> Result<Option<MangaUpdate>, Box<dyn Error>> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    if manga.completed {
+        println!("{} 已完结，跳过检查更新", manga.name);
+        return Ok(None);
+    }
+
+    let Some(online) = fetch_manga_outline(source, manga, cancelled).await? else {
+        if cancelled.load(Ordering::SeqCst) {
+            println!("⚠ 已取消，停止检查更新");
+        }
+        return Ok(None);
+    };
 
     let local_chapter_names = manga
         .chapter_names
@@ -547,37 +573,28 @@ async fn check_single_manga_update(
         .collect::<HashSet<_>>();
 
     let new_chapters = online
-        .chapters
+        .online_chapters
         .iter()
         .filter(|chapter| !local_chapter_names.contains(chapter.chapter_name.as_str()))
         .cloned()
         .collect::<Vec<_>>();
 
     if !new_chapters.is_empty() {
-        println!("{} 发现 {} 个新章节:", manga.name, new_chapters.len());
+        println!("{} 发现 {} 个新章节:", online.name, new_chapters.len());
         for (index, chapter) in new_chapters.iter().enumerate() {
             println!("  {}.{}", index + 1, chapter.chapter_name);
         }
         Ok(Some(MangaUpdate {
-            name: manga.name.clone(),
-            path_word,
-            source: source.id().to_string(),
-            online_chapters: online.chapters,
+            name: online.name,
+            path_word: online.path_word,
+            source: online.source,
+            online_chapters: online.online_chapters,
             new_chapters,
         }))
     } else {
-        println!("{} 没有更新", manga.name);
+        println!("{} 没有更新", online.name);
         Ok(None)
     }
-}
-
-/// 检查指定的一部本地漫画是否有更新。
-pub async fn check_manga_update(
-    source: &dyn MangaSource,
-    manga: &LocalManga,
-    cancelled: &AtomicBool,
-) -> Result<Option<MangaUpdate>, Box<dyn Error>> {
-    check_single_manga_update(source, manga, cancelled).await
 }
 
 /// 对比本地章节目录和线上章节目录，返回每部漫画新增的章节。

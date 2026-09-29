@@ -1,12 +1,13 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::time::{sleep, Duration};
 
-use Copy_ManGa_downloader::types::ChapterDetails;
+use Copy_ManGa_downloader::types::{ChapterContents, ChapterDetails};
 use Copy_ManGa_downloader::{
-    BASE_WEBSITE, CopyMangaSource, MangaSource, ZerobywSource, check_manga_update,
-    check_manga_updates, display_chapter_list, download, input_line, input_number,
+    BASE_WEBSITE, CopyMangaSource, MangaSource, ZerobywSource, check_manga_updates,
+    display_chapter_list, download, fetch_manga_outline, input_line, input_number,
     pause_on_error, read_manga_downloaded, save_chapter_details, set_manga_completed,
     update_selected_mangas,
 };
@@ -30,7 +31,7 @@ async fn main(){
    });
 
     // 启动时选择漫画源：之后所有搜索/下载/更新检查都走选定的适配器
-    let source: Arc<dyn MangaSource> = match input_number("选择漫画源：1:拷贝漫画  2:zerobyw搬运网\n", &cancelled).await {
+    let source: Arc<dyn MangaSource> = match input_number("选择漫画源：1:拷贝漫画(默认)  2:zerobyw搬运网\n", &cancelled).await {
         Some(2) => match ZerobywSource::new() {
             Ok(s) => Arc::new(s) as Arc<dyn MangaSource>,
             Err(e) => {
@@ -170,6 +171,32 @@ async fn mark_manga_completed(cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// 提示输入起始/结束话数（1-based，闭区间），校验通过后返回 0-based (begin, end)。
+/// 取消/EOF 返回 None。
+async fn input_chapter_range(total: usize, cancelled: &AtomicBool) -> Option<(usize, usize)> {
+    loop {
+        let mut begin = input_number("请输入起始话数(包含该话)：", cancelled).await?;
+
+        if begin < 1 {
+            println!("起始范围错误，请重新输入");
+            continue;
+        }
+
+        begin -= 1;
+
+        let mut end = input_number("请输入结束话数(包含该话)：", cancelled).await?;
+
+        if end < begin + 1 || end > total {
+            println!("结束范围错误，请重新输入");
+            continue;
+        }
+
+        end -= 1;
+
+        return Some((begin, end));
+    }
+}
+
 async fn check_selected_manga_update(
     source: Arc<dyn MangaSource>,
     cancelled: Arc<AtomicBool>,
@@ -204,20 +231,83 @@ async fn check_selected_manga_update(
         return Ok(());
     };
 
-    let update = check_manga_update(source.as_ref(), manga, &cancelled).await?;
-    if cancelled.load(Ordering::SeqCst) {
+    // 无论有没有新章节，都拉取线上章节列表展示，让用户自选区间下载：
+    // 既能补下新话，也能重下旧话覆盖坏图
+    let Some(outline) = fetch_manga_outline(source.as_ref(), manga, &cancelled).await? else {
+        return Ok(());
+    };
+
+    let total = outline.online_chapters.len();
+    if total == 0 {
+        println!("{} 线上没有章节", outline.name);
         return Ok(());
     }
 
-    match update {
-        Some(update) => {
-            update_selected_mangas(vec![update], source, cancelled).await
-        }
-        None => {
-            println!("{} 没有可下载的新章节", manga.name);
-            Ok(())
-        }
+    let local_chapter_names = manga.chapter_names.iter().collect::<HashSet<_>>();
+
+    println!(
+        "\n{} 线上共 {} 话（标 [新] 的表示本地没有）：",
+        outline.name, total
+    );
+    for (index, chapter) in outline.online_chapters.iter().enumerate() {
+        let tag = if local_chapter_names.contains(&chapter.chapter_name) {
+            ""
+        } else {
+            "  [新]"
+        };
+        println!("{}:{}{}", index + 1, chapter.chapter_name, tag);
     }
+
+    let Some((begin, end)) = input_chapter_range(total, &cancelled).await else {
+        println!("⚠ 已取消，返回主菜单");
+        return Ok(());
+    };
+
+    // 逐话拉取所选区间的图片直链；重下已有章节时文件会被覆盖，可用来修复坏图
+    let mut chapters = Vec::new();
+    for chapter in &outline.online_chapters[begin..=end] {
+        if cancelled.load(Ordering::SeqCst) {
+            println!("⚠ 已取消，停止下载");
+            return Ok(());
+        }
+
+        match source
+            .fetch_pages(&outline.path_word, &chapter.chapter_uuid, &cancelled)
+            .await
+        {
+            Ok(pages_url) if !pages_url.is_empty() => {
+                chapters.push(ChapterContents {
+                    chapter_name: chapter.chapter_name.clone(),
+                    chapter_uuid: chapter.chapter_uuid.clone(),
+                    len: pages_url.len(),
+                    pages_url,
+                });
+            }
+            Ok(_) => eprintln!("[!] {} 没有获取到图片直链，已跳过", chapter.chapter_name),
+            Err(e) => eprintln!("[!] {} 获取图片直链失败，已跳过: {}", chapter.chapter_name, e),
+        }
+
+        // 每话之间歇一下，避免请求过快触发站点限流
+        sleep(Duration::from_millis(1000)).await;
+    }
+
+    if chapters.is_empty() {
+        println!("所选区间没有可下载的章节");
+        return Ok(());
+    }
+
+    let end = chapters.len() - 1;
+    let details = ChapterDetails {
+        name: outline.name.clone(),
+        path_word: outline.path_word.clone(),
+        completed: false,
+        source: outline.source.clone(),
+        chapters,
+    };
+    download(details, 0, end, source.http().clone(), cancelled.clone()).await?;
+
+    println!("{} 下载完成", outline.name);
+    Ok(())
 }
 
 async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
@@ -275,32 +365,10 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
 
     display_chapter_list(&chapter_details);
 
-   let (begin,end) = loop {
-        let mut begin =
-            input_number("请输入起始话数(包含该话)：", &cancelled)
-                .await
-                .expect("获取起始话数失败");
-
-        if begin < 1 {
-            println!("起始范围错误，请重新输入");
-            continue;
-        }
-
-        begin -= 1;
-
-        let mut end =
-            input_number("请输入结束话数(包含该话)：", &cancelled)
-                .await
-                .expect("获取结束话数失败");
-
-        if end < begin + 1 || end > chapter_details.chapters.len() {
-            println!("结束范围错误，请重新输入");
-            continue;
-        }
-
-        end -= 1;
-
-        break (begin,end);
+    let Some((begin, end)) = input_chapter_range(chapter_details.chapters.len(), &cancelled).await
+    else {
+        println!("⚠ 已取消，返回主菜单");
+        return Ok(());
     };
 
     download(chapter_details, begin, end, source.http().clone(), cancelled.clone()).await?;
