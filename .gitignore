@@ -6,3 +6,5 @@
 !.aider.conf.yml
 
 .omc/
+
+.zcodeignore
