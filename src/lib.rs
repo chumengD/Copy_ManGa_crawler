@@ -139,15 +139,13 @@ pub async fn save_chapter_details(
         .await
         .with_context(|| format!("创建目录失败: {}", output_dir.display()))?;
 
-    // 落盘时保留已有的完结标记与来源标识，避免检查/更新章节时
-    // 把用户手动标记的完结状态或漫画所属源冲掉。
+    // 落盘时保留已有的完结标记，避免检查/更新章节时把用户手动标记的完结状态冲掉。
+    // source 不保留：快照数据来自当前源，source 必须与 path_word 同源，
+    // 否则跨源检查更新后会把 A 源的 ID 配上 B 源的标识，下次按标识用 ID 就会查错站
     let mut details = details.clone();
     if let Ok(text) = read_to_string(&output_path).await {
         if let Ok(existing) = serde_json::from_str::<ChapterDetails>(&text) {
             details.completed = existing.completed;
-            if !existing.source.is_empty() {
-                details.source = existing.source;
-            }
         }
     }
 
@@ -204,7 +202,7 @@ pub async fn download(
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     //为多线程下载做准备，限制并发数量，避免请求过快触发站点限流
-    let once_max_dowload = Arc::new(Semaphore::new(4));
+    let once_max_dowload = Arc::new(Semaphore::new(64));
 
     let manga_title = &chapter_details.name;
 
@@ -388,6 +386,105 @@ pub fn display_chapter_list(chapters:&ChapterDetails){
     println!("该漫画共{}话",chapters.chapters.len());
 }
 
+/// 边拉直链边下载：第 i 话的直链一到手就转后台下载，与此同时才去拉第 i+1 话的直链，
+/// 把「逐话拉直链」和「下载」两段重叠起来。直链拉取仍保持串行、话间歇 1 秒防限流；
+/// 开下一话前会先等上一话下完，保证同一时刻只有一章在下载、总并发不叠加。
+/// 拉直链失败的话打印后跳过，不拖累其余话；取消时尽快收尾返回。
+pub async fn download_chapters_streaming(
+    manga_name: &str,
+    path_word: &str,
+    source: &dyn MangaSource,
+    chapters: &[ChapterContents],
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error>> {
+    let total = chapters.len();
+    // 上一话的后台下载任务；开下一话前先等它结束，避免多话并发叠加
+    let mut prev: Option<tokio::task::JoinHandle<()>> = None;
+    let mut skipped = 0usize;
+
+    for (index, chapter) in chapters.iter().enumerate() {
+        if cancelled.load(Ordering::SeqCst) {
+            println!("⚠ 已取消，停止下载");
+            break;
+        }
+
+        // 直链拉取是最容易触发站点限流的环节：保持一话一话串行
+        let pages_url = match source
+            .fetch_pages(path_word, &chapter.chapter_uuid, &cancelled)
+            .await
+        {
+            Ok(pages_url) if !pages_url.is_empty() => pages_url,
+            Ok(_) => {
+                eprintln!("[!] {} 没有获取到图片直链，已跳过", chapter.chapter_name);
+                skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[!] {} 获取图片直链失败，已跳过: {}",
+                    chapter.chapter_name, e
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+
+        wait_chapter_download(prev.take()).await;
+        println!(
+            "({}/{}) {} 拿到 {} 页直链，开始下载",
+            index + 1,
+            total,
+            chapter.chapter_name,
+            pages_url.len()
+        );
+
+        let details = ChapterDetails {
+            name: manga_name.to_string(),
+            path_word: path_word.to_string(),
+            completed: false,
+            source: source.id().to_string(),
+            chapters: vec![ChapterContents {
+                chapter_name: chapter.chapter_name.clone(),
+                chapter_uuid: chapter.chapter_uuid.clone(),
+                len: pages_url.len(),
+                pages_url,
+            }],
+        };
+        let client = source.http().clone();
+        let cancelled_clone = cancelled.clone();
+        let title = manga_name.to_string();
+
+        // 下载器自身的报错在任务内打印：硬错误（如建目录失败）后续话也会复现，
+        // 逐话提示比整趟中断保留的成果更多
+        prev = Some(tokio::spawn(async move {
+            if let Err(e) = download(details, 0, 0, client, cancelled_clone).await {
+                eprintln!("[!] {} 下载出错: {e}", title);
+            }
+        }));
+
+        // 话与话之间歇一下再拉下一话直链（下载在后台继续，不耽误整体进度）
+        if index + 1 < total {
+            sleep(BETWEEN_MANGA_DELAY).await;
+        }
+    }
+
+    wait_chapter_download(prev.take()).await;
+
+    if total > 0 && skipped >= total {
+        println!("{total} 话全都没拿到图片直链，没有下载任何内容");
+    }
+    Ok(())
+}
+
+/// 等待后台下载任务收尾；任务意外崩溃时打印后继续（比旧版串行下载更抗单话故障）。
+async fn wait_chapter_download(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        if let Err(e) = handle.await {
+            eprintln!("下载任务异常结束: {e}");
+        }
+    }
+}
+
 
 /// 报错后等待用户按回车再退出，避免窗口立即关闭看不到错误信息
 pub fn pause_on_error() {
@@ -493,7 +590,7 @@ async fn read_local_meta(manga_dir: &Path, name: &str) -> (Option<String>, bool,
 
 /// 解析漫画 ID 并拉取线上章节大纲，顺带把快照落盘（缓存漫画 ID / source，保留完结标记）。
 /// 不判断完结与否——是否跳过由调用方决定。
-/// 返回 `Ok(None)` 表示被取消、漫画不属于当前源或没找到精确匹配（原因已打印）。
+/// 返回 `Ok(None)` 表示被取消或没找到精确匹配（原因已打印）。
 pub async fn fetch_manga_outline(
     source: &dyn MangaSource,
     manga: &LocalManga,
@@ -503,23 +600,24 @@ pub async fn fetch_manga_outline(
         return Ok(None);
     }
 
-    // 旧版下载的 JSON 里没有 source 字段，按当前源处理（向后兼容）；
-    // 有 source 但与当前源不符的漫画跳过，避免拿错站点的 ID 去请求。
-    if let Some(manga_source) = &manga.source {
-        if manga_source != source.id() {
+    // 漫画 ID 是每个源各自的，换源后缓存 ID 就指向别的站的漫画，作废；
+    // 一律按名称在当前源重新查找，任何一个源都可以检查任意本地漫画的更新
+    let cached_path_word = match &manga.source {
+        Some(manga_source) if manga_source != source.id() => {
             println!(
-                "{} 属于源 {}，当前源为 {}，跳过",
+                "{} 记录于源 {}，当前源为 {}，将按名称在当前源查找",
                 manga.name, manga_source, source.id()
             );
-            return Ok(None);
+            None
         }
-    }
+        _ => manga.path_word.clone(),
+    };
 
     println!("正在检查: {}", manga.name);
 
-    // 新版下载会在漫画文件夹里留下 <漫画名>.json，里面已缓存漫画 ID，直接用即可；
-    // 只有旧版下载没有该 JSON 时，才联网用名称反查漫画 ID。
-    let path_word = match manga.path_word.clone() {
+    // 源匹配时直接用本地缓存的漫画 ID；跨源或旧版下载没有缓存时，
+    // 联网用名称反查当前源的漫画 ID
+    let path_word = match cached_path_word {
         Some(path_word) => {
             println!("使用本地记录的漫画 ID: {}", path_word);
             path_word
@@ -698,52 +796,7 @@ pub async fn update_selected_mangas(
         println!("{}:{}", index + 1, chapter.chapter_name);
     }
 
-    // 章节大纲接口只返回章节列表，不含图片直链；下载前必须逐话补齐，
-    // 否则 download() 拿到空 pages_url 会一个文件都不下。
-    // 拉取失败的话跳过并在结尾提示，下次检查更新会再次将其列为新章节。
-    let mut new_chapters = Vec::new();
-    for chapter in &update.new_chapters {
-        if cancelled.load(Ordering::SeqCst) {
-            println!("⚠ 已取消，停止更新");
-            return Ok(());
-        }
-
-        match source
-            .fetch_pages(&update.path_word, &chapter.chapter_uuid, &cancelled)
-            .await
-        {
-            Ok(pages_url) if !pages_url.is_empty() => {
-                new_chapters.push(ChapterContents {
-                    chapter_name: chapter.chapter_name.clone(),
-                    chapter_uuid: chapter.chapter_uuid.clone(),
-                    len: pages_url.len(),
-                    pages_url,
-                });
-            }
-            Ok(_) => eprintln!("[!] {} 没有获取到图片直链，已跳过", chapter.chapter_name),
-            Err(e) => eprintln!("[!] {} 获取图片直链失败，已跳过: {}", chapter.chapter_name, e),
-        }
-
-        // 每话之间歇一下，避免请求过快触发站点限流
-        sleep(BETWEEN_MANGA_DELAY).await;
-    }
-
-    if new_chapters.is_empty() {
-        println!("{} 的新章节全部拉取直链失败，本次不下载", update.name);
-        return Ok(());
-    }
-
     let manga_name = update.name.clone();
-    // 新增章节从头下到尾，不再让用户选范围。
-    let begin = 0;
-    let end = new_chapters.len() - 1;
-    let download_details = ChapterDetails {
-        name: manga_name.clone(),
-        path_word: update.path_word.clone(),
-        completed: false,
-        source: update.source.clone(),
-        chapters: new_chapters,
-    };
 
     // 更新也要落盘 <漫画名>.json，把漫画 ID 缓存进漫画文件夹，
     // 这样下次检查更新就能直接读本地缓存，不必再联网反查。
@@ -759,7 +812,15 @@ pub async fn update_selected_mangas(
     let json_path = save_chapter_details(&snapshot).await?;
     println!("章节详情已保存到: {}", json_path.display());
 
-    download(download_details, begin, end, source.http().clone(), cancelled).await?;
+    // 全部新章节边拉直链边下载，不再预先逐话拉完直链才开始下
+    download_chapters_streaming(
+        &update.name,
+        &update.path_word,
+        source.as_ref(),
+        &update.new_chapters,
+        cancelled,
+    )
+    .await?;
 
     println!("{} 更新完成", manga_name);
     Ok(())

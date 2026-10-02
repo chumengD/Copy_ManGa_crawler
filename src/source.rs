@@ -13,6 +13,10 @@ pub trait MangaSource: Send + Sync {
     /// 旧版 JSON 没有该字段时按拷贝漫画处理（向后兼容）。
     fn id(&self) -> &'static str;
 
+    /// 源被选中后立即执行的引导（如 zerobyw 的登录引导）。默认无操作。
+    /// 引导允许被跳过（用户拒绝 / Ctrl+C / stdin 关闭），失败不得中断主流程。
+    async fn on_selected(&self, _cancelled: &AtomicBool) {}
+
     /// 拉取图片直链与下载图片共用的 HTTP 客户端（各源自带 UA / Referer / 证书策略）。
     fn http(&self) -> &Client;
 
