@@ -1,6 +1,8 @@
 //! 拷贝漫画（copymanga）站点适配器。
 //!
-//! 该站的搜索接口返回明文 JSON；章节大纲、图片直链等接口返回 AES-CBC 密文：
+//! 搜索走独立 API 域名上的 v3 明文 JSON 接口，且必须携带 `version` / `platform`
+//! 请求头（官方客户端版本门槛），否则返回 200 但列表为空；章节大纲、图片直链等
+//! 接口仍走网页主站，返回 AES-CBC 密文：
 //! 1. 从页面 HTML 中用正则提取密钥（如 `ccz` / `cct`）与 token
 //! 2. 调用详情接口拿到 `results` 密文字段
 //! 3. `decrypt_results`：密文前 16 字符作 IV，其余 hex 解码后 AES-128-CBC + PKCS7 解密
@@ -23,6 +25,14 @@ type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 /// 站点地址直接硬编码，不再依赖外部 config.toml
 pub const BASE_WEBSITE: &str = "https://ios.copymanga.club";
+
+/// 搜索接口的 API 域名，与网页主站分离。
+/// 官方会不定期更换该域名（命名含年月，如 202601 = 2026-01），失效时可到
+/// github.com/copy-manga/copymanga 发布页或 lanyeeee/copymanga-downloader 查最新地址
+pub const API_BASE_WEBSITE: &str = "https://api.copy202601.com";
+
+/// v3 接口的客户端版本门槛，两个头缺一不可，缺失时接口返回 200 但列表为空
+const SEARCH_API_HEADERS: [(&str, &str); 2] = [("version", "2025.08.15"), ("platform", "1")];
 
 /// 相邻网络请求之间的最小间隔，避免请求过快触发站点限流（Too Many Requests）
 const REQUEST_DELAY: Duration = Duration::from_millis(1000);
@@ -165,10 +175,10 @@ impl MangaSource for CopyMangaSource {
     }
 
     async fn search(&self, keyword: &str, cancelled: &AtomicBool) -> Result<Vec<ManGa_item>> {
-        let base_url = format!("{}/api/kb/web/searchci/comics", self.base_website);
+        let base_url = format!("{API_BASE_WEBSITE}/api/v3/search/comic");
         let params = [
             ("offset", "0"),
-            ("platform", "2"),
+            ("platform", "1"),
             ("limit", "12"),
             ("q", keyword),
             ("q_type", ""),
@@ -176,7 +186,13 @@ impl MangaSource for CopyMangaSource {
 
         let Some(resp_text) = self
             .get_with_retry(
-                || self.client.get(&base_url).query(&params),
+                || {
+                    let mut request = self.client.get(&base_url).query(&params);
+                    for (name, value) in SEARCH_API_HEADERS {
+                        request = request.header(name, value);
+                    }
+                    request
+                },
                 "搜索",
                 5,
                 REQUEST_DELAY,
@@ -188,7 +204,6 @@ impl MangaSource for CopyMangaSource {
         };
 
         let resp_json: Response = serde_json::from_str(&resp_text)?;
-        println!("reponse：{:#?}", resp_json);
 
         println!("以下为搜索结果(仅列举至多12项)：");
         for (index, item) in resp_json.results.list.iter().enumerate() {
@@ -251,10 +266,10 @@ impl MangaSource for CopyMangaSource {
     }
 
     async fn find_by_name(&self, name: &str, cancelled: &AtomicBool) -> Result<Option<String>> {
-        let url = format!("{}/api/kb/web/searchci/comics", self.base_website);
+        let url = format!("{API_BASE_WEBSITE}/api/v3/search/comic");
         let params = [
             ("offset", "0"),
-            ("platform", "2"),
+            ("platform", "1"),
             ("limit", "20"),
             ("q", name),
             ("q_type", ""),
@@ -265,7 +280,15 @@ impl MangaSource for CopyMangaSource {
                 return Ok(None);
             }
 
-            match self.client.get(&url).query(&params).send().await {
+            let request = || {
+                let mut rb = self.client.get(&url).query(&params);
+                for (header, value) in SEARCH_API_HEADERS {
+                    rb = rb.header(header, value);
+                }
+                rb
+            };
+
+            match request().send().await {
                 Ok(response) if response.status().is_success() => {
                     let text = response.text().await?;
                     let result: Response = serde_json::from_str(&text)?;
