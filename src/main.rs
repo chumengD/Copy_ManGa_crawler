@@ -2,14 +2,12 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::time::{sleep, Duration};
-
-use Copy_ManGa_downloader::types::{ChapterContents, ChapterDetails};
+use Copy_ManGa_downloader::types::ChapterDetails;
 use Copy_ManGa_downloader::{
     BASE_WEBSITE, CopyMangaSource, MangaSource, ZerobywSource, check_manga_updates,
-    display_chapter_list, download, fetch_manga_outline, input_line, input_number,
-    pause_on_error, read_manga_downloaded, save_chapter_details, set_manga_completed,
-    stdin_at_eof, update_selected_mangas,
+    display_chapter_list, download_chapters_streaming, fetch_manga_outline, input_line,
+    input_number, pause_on_error, read_manga_downloaded, save_chapter_details,
+    set_manga_completed, stdin_at_eof, update_selected_mangas,
 };
 
 #[tokio::main]
@@ -55,6 +53,9 @@ async fn main(){
             }
         },
     };
+
+    // 选定源后先跑该源自带的引导（如 zerobyw 的登录引导），可跳过
+    source.on_selected(&cancelled).await;
 
    'outer: loop{
        cancelled.store(false, Ordering::SeqCst);
@@ -268,48 +269,15 @@ async fn check_selected_manga_update(
         return Ok(());
     };
 
-    // 逐话拉取所选区间的图片直链；重下已有章节时文件会被覆盖，可用来修复坏图
-    let mut chapters = Vec::new();
-    for chapter in &outline.online_chapters[begin..=end] {
-        if cancelled.load(Ordering::SeqCst) {
-            println!("⚠ 已取消，停止下载");
-            return Ok(());
-        }
-
-        match source
-            .fetch_pages(&outline.path_word, &chapter.chapter_uuid, &cancelled)
-            .await
-        {
-            Ok(pages_url) if !pages_url.is_empty() => {
-                chapters.push(ChapterContents {
-                    chapter_name: chapter.chapter_name.clone(),
-                    chapter_uuid: chapter.chapter_uuid.clone(),
-                    len: pages_url.len(),
-                    pages_url,
-                });
-            }
-            Ok(_) => eprintln!("[!] {} 没有获取到图片直链，已跳过", chapter.chapter_name),
-            Err(e) => eprintln!("[!] {} 获取图片直链失败，已跳过: {}", chapter.chapter_name, e),
-        }
-
-        // 每话之间歇一下，避免请求过快触发站点限流
-        sleep(Duration::from_millis(1000)).await;
-    }
-
-    if chapters.is_empty() {
-        println!("所选区间没有可下载的章节");
-        return Ok(());
-    }
-
-    let end = chapters.len() - 1;
-    let details = ChapterDetails {
-        name: outline.name.clone(),
-        path_word: outline.path_word.clone(),
-        completed: false,
-        source: outline.source.clone(),
-        chapters,
-    };
-    download(details, 0, end, source.http().clone(), cancelled.clone()).await?;
+    // 选定区间边拉直链边下载；重下已有章节时文件会被覆盖，可用来修复坏图
+    download_chapters_streaming(
+        &outline.name,
+        &outline.path_word,
+        source.as_ref(),
+        &outline.online_chapters[begin..=end],
+        cancelled.clone(),
+    )
+    .await?;
 
     println!("{} 下载完成", outline.name);
     Ok(())
@@ -345,7 +313,9 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
         return Ok(());
     }
 
-    let mut chapter_details = ChapterDetails {
+    // 章节列表只含名称与章节 ID，足够展示和选区间；图片直链在选定区间后
+    // 边拉边下，不再预先把每一话的阅读页都请求一遍（zerobyw 一章阅读页要好几秒）
+    let chapter_details = ChapterDetails {
         name: selected_manga.name.clone(),
         path_word: selected_manga.path_word.clone(),
         completed: false,
@@ -353,18 +323,6 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
         chapters,
     };
 
-    for chapter in &mut chapter_details.chapters {
-        if let Ok(pages_url) = source
-            .fetch_pages(&chapter_details.path_word, &chapter.chapter_uuid, &cancelled)
-            .await
-        {
-            chapter.pages_url = pages_url;
-            chapter.len = chapter.pages_url.len();
-        }
-        // 每话之间歇一下，避免请求过快触发站点限流
-        sleep(Duration::from_millis(1000)).await;
-    }
-    dbg!(&chapter_details);
     let json_path = save_chapter_details(&chapter_details).await?;
     println!("章节详情已保存到: {}", json_path.display());
 
@@ -376,7 +334,15 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
         return Ok(());
     };
 
-    download(chapter_details, begin, end, source.http().clone(), cancelled.clone()).await?;
+    download_chapters_streaming(
+        &chapter_details.name,
+        &chapter_details.path_word,
+        source.as_ref(),
+        &chapter_details.chapters[begin..=end],
+        cancelled.clone(),
+    )
+    .await?;
 
+    println!("{} 下载完成", chapter_details.name);
     Ok(())
 }
