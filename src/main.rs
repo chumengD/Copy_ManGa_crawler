@@ -21,10 +21,14 @@ async fn main(){
     tokio::spawn(async move {
         loop {
             tokio::signal::ctrl_c().await.ok();
+            // 同一次操作内第二次按下：立即强制退出，与提示一致。
+            // 计数在一轮操作完整跑完后由主循环清零，输入提示处连按两次同样能退出
+            if count.fetch_add(1, Ordering::SeqCst) >= 1 {
+                println!("\n⚠ 再次收到 Ctrl+C，强制退出...");
+                std::process::exit(0);
+            }
             flag.store(true, Ordering::SeqCst);
-            count.fetch_add(1, Ordering::SeqCst);
-            println!("\n⚠ 收到 Ctrl+C，正在返回主菜单...");
-            println!("⚠ 下一次按 Ctrl+C 将直接退出程序...\n\n");
+            println!("\n⚠ 收到 Ctrl+C，正在取消当前操作并返回主菜单（再按一次立即退出）...");
        }
    });
 
@@ -58,12 +62,10 @@ async fn main(){
     source.on_selected(&cancelled).await;
 
    'outer: loop{
+       // 回到主菜单：此刻所有在途任务都已收尾，取消标志可以安全清零
        cancelled.store(false, Ordering::SeqCst);
-        if cancelled_count.load(Ordering::SeqCst) >=2{
-            break 'outer;
-        }
        println!("1:搜索  2:指定漫画检查更新  3:检查全部更新  4:标记完结  5:退出");
-       let choice =input_number("你想要干什么：", &cancelled).await;
+       let choice = input_number("你想要干什么：", &cancelled).await;
 
 
         match choice{
@@ -125,6 +127,9 @@ async fn main(){
                                 continue 'outer;
                             }
                         }
+                    // 一轮操作完整跑完才清零计数：操作进行中连按两次 Ctrl+C
+                    // 由信号监听任务直接退出，回到主菜单后重新计数
+                    cancelled_count.store(0, Ordering::SeqCst);
                     }
 
             None => {
@@ -133,7 +138,7 @@ async fn main(){
                     println!("输入已结束，退出程序.....");
                     break 'outer;
                 }
-                println!("⚠ 输入无效，请重新输入");
+                // Ctrl+C 取消了当前输入：提示已由信号监听任务打印，直接回到主菜单
                 continue 'outer;
             }
 
@@ -279,7 +284,10 @@ async fn check_selected_manga_update(
     )
     .await?;
 
-    println!("{} 下载完成", outline.name);
+    // 取消时进度条与提示已交代，不再误报"下载完成"
+    if !cancelled.load(Ordering::SeqCst) {
+        println!("{} 下载完成", outline.name);
+    }
     Ok(())
 }
 
@@ -343,6 +351,9 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
     )
     .await?;
 
-    println!("{} 下载完成", chapter_details.name);
+    // 取消时进度条与提示已交代，不再误报"下载完成"
+    if !cancelled.load(Ordering::SeqCst) {
+        println!("{} 下载完成", chapter_details.name);
+    }
     Ok(())
 }

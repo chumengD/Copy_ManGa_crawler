@@ -9,17 +9,23 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, REFERER};
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{sleep, Duration};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::time::{sleep, timeout, Duration};
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use regex::Regex;
 
 use crate::source::MangaSource;
 use crate::types::{ChapterContents, ManGa_item, Response};
+use crate::wait_cancelled;
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
@@ -40,20 +46,37 @@ const REQUEST_DELAY: Duration = Duration::from_millis(1000);
 pub struct CopyMangaSource {
     base_website: String,
     client: Client,
+    /// 链路测速得出的地址族偏好：true = IPv6 优先。解析器与测速逻辑共享，
+    /// 测速完成后立即生效（见 prepare_for_download）
+    prefer_ipv6: Arc<AtomicBool>,
 }
 
 impl CopyMangaSource {
     pub fn new(base_website: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(REFERER, base_website.parse()?);
+        // 初始偏好 IPv6：Cloudflare 的 v6 入口普遍没有 v4 拥挤；
+        // 每次批量下载前会实测两条链路的吞吐并纠正（见 prepare_for_download）
+        let prefer_ipv6 = Arc::new(AtomicBool::new(true));
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
             .danger_accept_invalid_certs(true)
+            // 图片 CDN（mangafuna/mangafunb 系）挂在 Cloudflare 后面，IPv4/IPv6 是
+            // 两条独立链路。hyper 只按解析顺序连第一个能连上的地址、不做传输测速，
+            // 所以由解析器按测速结果决定顺序，见 FamilyOrderResolver
+            .dns_resolver(Arc::new(FamilyOrderResolver {
+                prefer_ipv6: prefer_ipv6.clone(),
+            }))
+            // 连接黑洞时限制单次卡死时长；正文流停滞时快速报错进入重试，
+            // 而不是静默挂满外层的单页 60s 预算
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
             .default_headers(headers)
             .build()?;
         Ok(Self {
             base_website: base_website.trim_end_matches('/').to_string(),
             client,
+            prefer_ipv6,
         })
     }
 
@@ -72,8 +95,21 @@ impl CopyMangaSource {
                 return Ok(None);
             }
 
-            match request().send().await {
-                Ok(res) if res.status().is_success() => return Ok(Some(res.text().await?)),
+            // select 包住在途请求：Ctrl+C 时立即丢弃请求并中止连接，
+            // 而不是等当前请求自然超时（read_timeout 最长 30s）才轮到标志检查
+            let response = tokio::select! {
+                _ = wait_cancelled(cancelled) => return Ok(None),
+                res = request().send() => res,
+            };
+
+            match response {
+                Ok(res) if res.status().is_success() => {
+                    let text = tokio::select! {
+                        _ = wait_cancelled(cancelled) => return Ok(None),
+                        text = res.text() => text?,
+                    };
+                    return Ok(Some(text));
+                }
                 Ok(res) => {
                     println!("{what}请求失败，状态码: {}，正在重试...", res.status());
                 }
@@ -164,6 +200,102 @@ impl CopyMangaSource {
     }
 }
 
+/// DNS 解析器：按测速共享状态决定 IPv4/IPv6 谁排在解析结果前面。
+///
+/// hyper 连接时按解析顺序选第一个能连上的地址，且只比"谁先连上"不比"谁传得快"；
+/// 两条链路通常都能秒连，快慢只能靠传输测速分辨（见 prepare_for_download）。
+/// 落选的地址族不会丢：hyper 自带 happy-eyeballs，首选族 300ms 内没连上时
+/// 备选族会并行开连自动兜底（对没有 IPv6 的用户这层兜底就是正常路径）。
+struct FamilyOrderResolver {
+    prefer_ipv6: Arc<AtomicBool>,
+}
+
+impl Resolve for FamilyOrderResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let prefer_ipv6 = self.prefer_ipv6.load(Ordering::Relaxed);
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            Ok(Box::new(order_addrs(addrs, prefer_ipv6).into_iter()) as Addrs)
+        })
+    }
+}
+
+/// 把 IPv6 / IPv4 分组排序，prefer_ipv6 决定谁在前（各自保持原有相对顺序）
+fn order_addrs(addrs: Vec<SocketAddr>, prefer_ipv6: bool) -> Vec<SocketAddr> {
+    let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addrs.into_iter().partition(|addr| addr.is_ipv6());
+    if prefer_ipv6 {
+        v6.into_iter().chain(v4).collect()
+    } else {
+        v4.into_iter().chain(v6).collect()
+    }
+}
+
+/// 链路测速的单次下载窗口：窗口内能拉到多少字节算多少（窗口内拉完按实际耗时算）。
+/// 几秒足够让健康链路（秒级下完一张图）和劣化链路（几十 KB/s）拉开数量级差距。
+const PROBE_WINDOW: Duration = Duration::from_secs(6);
+
+/// 用指定地址族（"0.0.0.0" 仅 IPv4，"::" 仅 IPv6）下载样本图，返回实测吞吐（字节/秒）。
+/// 地址族不可用（没有 IPv6 路由等）会立刻失败，由调用方按 0 分处理。
+async fn measure_family_speed(base_website: &str, sample_url: &str, bind: &str) -> Result<f64> {
+    let mut headers = HeaderMap::new();
+    headers.insert(REFERER, base_website.parse()?);
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        .danger_accept_invalid_certs(true)
+        .default_headers(headers)
+        .local_address(bind.parse::<IpAddr>()?)
+        .connect_timeout(Duration::from_secs(5))
+        .build()?;
+
+    let started = Instant::now();
+    let response = client.get(sample_url).send().await?;
+    let mut stream = response.bytes_stream();
+    let received = Arc::new(AtomicU64::new(0));
+    let counter = received.clone();
+    // 超时把 future 连同流一起丢弃，已收字数保存在共享计数器里
+    let _ = timeout(PROBE_WINDOW, async move {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    counter.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+
+    let elapsed = started.elapsed().as_secs_f64().max(0.05);
+    Ok(received.load(Ordering::Relaxed) as f64 / elapsed)
+}
+
+/// v4 领先不足该倍数视为持平（保持 v6 优先），避免两条链路都健康时被噪声翻转
+const PROBE_TIE_FACTOR: f64 = 1.3;
+
+/// 比较两条链路的实测吞吐，返回是否应优先 IPv6
+fn should_prefer_ipv6(v4_speed: f64, v6_speed: f64) -> bool {
+    if v6_speed >= v4_speed {
+        true
+    } else {
+        v4_speed < v6_speed * PROBE_TIE_FACTOR
+    }
+}
+
+/// 把字节/秒格式化成可读速度
+fn format_speed(bytes_per_sec: f64) -> String {
+    if bytes_per_sec <= 0.0 {
+        "不可用".to_string()
+    } else if bytes_per_sec < 1024.0 {
+        format!("{:.0} 字节/秒", bytes_per_sec)
+    } else if bytes_per_sec < 1024.0 * 1024.0 {
+        format!("{:.0} KB/s", bytes_per_sec / 1024.0)
+    } else {
+        format!("{:.1} MB/s", bytes_per_sec / 1024.0 / 1024.0)
+    }
+}
+
 #[async_trait]
 impl MangaSource for CopyMangaSource {
     fn id(&self) -> &'static str {
@@ -172,6 +304,47 @@ impl MangaSource for CopyMangaSource {
 
     fn http(&self) -> &Client {
         &self.client
+    }
+
+    /// 下载前的链路测速：拿第一话的真实图片直链，对 IPv4 / IPv6 并发各拉一次，
+    /// 按实测吞吐决定本次下载走哪条链路（写进共享偏好，解析器立即生效）。
+    /// 测速是尽力而为：全失败或被取消时保持现有偏好，不影响下载。
+    async fn prepare_for_download(&self, sample_page_url: Option<&str>, cancelled: &AtomicBool) {
+        let Some(url) = sample_page_url else {
+            return;
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+
+        println!(
+            "正在给图片 CDN 测速：IPv4 / IPv6 并发各下载一页样本（最多 {} 秒）",
+            PROBE_WINDOW.as_secs()
+        );
+        let (v4_measured, v6_measured) = tokio::join!(
+            measure_family_speed(&self.base_website, url, "0.0.0.0"),
+            measure_family_speed(&self.base_website, url, "::"),
+        );
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        let v4_speed = v4_measured.unwrap_or(0.0);
+        let v6_speed = v6_measured.unwrap_or(0.0);
+
+        // 两条链路都没拿到样本（样本图失效、站点不可达等）：保持现状不折腾
+        if v4_speed <= 0.0 && v6_speed <= 0.0 {
+            println!("两条链路都没能下载样本图，跳过测速，保持 IPv6 优先");
+            return;
+        }
+
+        let prefer_ipv6 = should_prefer_ipv6(v4_speed, v6_speed);
+        self.prefer_ipv6.store(prefer_ipv6, Ordering::Relaxed);
+        println!(
+            "测速结果：IPv4 {} / IPv6 {}，本次下载优先走 {}",
+            format_speed(v4_speed),
+            format_speed(v6_speed),
+            if prefer_ipv6 { "IPv6" } else { "IPv4" }
+        );
     }
 
     async fn search(&self, keyword: &str, cancelled: &AtomicBool) -> Result<Vec<ManGa_item>> {
@@ -288,9 +461,17 @@ impl MangaSource for CopyMangaSource {
                 rb
             };
 
-            match request().send().await {
+            let response = tokio::select! {
+                _ = wait_cancelled(cancelled) => return Ok(None),
+                res = request().send() => res,
+            };
+
+            match response {
                 Ok(response) if response.status().is_success() => {
-                    let text = response.text().await?;
+                    let text = tokio::select! {
+                        _ = wait_cancelled(cancelled) => return Ok(None),
+                        text = response.text() => text?,
+                    };
                     let result: Response = serde_json::from_str(&text)?;
                     return Ok(result
                         .results
@@ -422,6 +603,48 @@ mod tests {
         assert_eq!(chapters[0].chapter_uuid, "uuid-01");
         assert_eq!(chapters[1].chapter_name, "第02话");
         assert_eq!(chapters[1].chapter_uuid, "uuid-02");
+    }
+
+    #[test]
+    fn order_addrs_respects_family_preference() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4 = |a: [u8; 4]| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(a)), 443);
+        let v6 = |seg: u16| {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, seg)), 443)
+        };
+        // Windows 下解析结果常 v4 在前
+        let raw = vec![
+            v4([104, 21, 23, 76]),
+            v6(0x174c),
+            v4([172, 67, 209, 202]),
+            v6(0xd1ca),
+        ];
+
+        let v6_first = order_addrs(raw.clone(), true);
+        assert!(v6_first[0].is_ipv6() && v6_first[1].is_ipv6());
+        assert!(v6_first[2].is_ipv4() && v6_first[3].is_ipv4());
+
+        let v4_first = order_addrs(raw, false);
+        assert!(v4_first[0].is_ipv4() && v4_first[1].is_ipv4());
+        assert!(v4_first[2].is_ipv6() && v4_first[3].is_ipv6());
+
+        // 只有单一地址族时无论偏好如何都保持原样
+        let only_v4 = vec![v4([1, 2, 3, 4])];
+        assert_eq!(order_addrs(only_v4.clone(), true), only_v4);
+        assert_eq!(order_addrs(only_v4, false), vec![v4([1, 2, 3, 4])]);
+        assert!(order_addrs(Vec::new(), true).is_empty());
+    }
+
+    #[test]
+    fn speed_comparison_respects_tie_band() {
+        // v6 更快或差距在持平带内：保持 v6 优先
+        assert!(should_prefer_ipv6(100.0, 200.0));
+        assert!(should_prefer_ipv6(110.0, 100.0));
+        // v4 领先超过 1.3 倍才翻转
+        assert!(!should_prefer_ipv6(200.0, 100.0));
+        // 一条链路不可用时另一条直接胜出
+        assert!(should_prefer_ipv6(0.0, 1.0));
+        assert!(!should_prefer_ipv6(1.0, 0.0));
     }
 
     #[tokio::test]

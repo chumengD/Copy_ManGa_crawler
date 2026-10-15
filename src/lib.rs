@@ -86,8 +86,9 @@ pub async fn input_line(prompt: &str, cancelled: &AtomicBool) -> Option<String> 
     }
 }
 
-/// 每隔 50ms 检查一次取消标志，置位后立即返回
-async fn wait_cancelled(cancelled: &AtomicBool) {
+/// 每隔 50ms 检查一次取消标志，置位后立即返回。
+/// 供 select! 与网络请求竞争：标志置位即放弃请求，而不是等请求自然超时。
+pub(crate) async fn wait_cancelled(cancelled: &AtomicBool) {
     while !cancelled.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -200,6 +201,9 @@ pub async fn download(
     end:usize,
     client: Client,
     cancelled: Arc<AtomicBool>,
+    // 单页落盘扩展名（不含点）。各源的图片真实格式不同（拷贝漫画直链写 .jpg
+    // 实际是 webp，zerobyw 是 jpg），由 MangaSource::image_extension 决定
+    page_ext: &'static str,
 ) -> Result<(), Box<dyn Error>> {
     //为多线程下载做准备，限制并发数量，避免请求过快触发站点限流
     let once_max_dowload = Arc::new(Semaphore::new(64));
@@ -258,104 +262,94 @@ pub async fn download(
                 }
                 let _permit = once_max_download_clone.acquire_owned().await.unwrap();
 
-                // 每个页面请求前稍微等待，控制整体下载速率
-                sleep(Duration::from_millis(300)).await;
-
                 let page_path = format!(
-                    "./download/{}/{}/{}.webp",
+                    "./download/{}/{}/{}.{}",
                     title_clone,
                     chapter_clone.chapter_name,
-                    index + 1
+                    index + 1,
+                    page_ext
                 );
-                let limit = Duration::from_secs(60);
 
-                //在开始下载前创建相应图片文件
-                let timed_out = timeout(limit, async {
-                    let mut isErr: bool = false;
-                    loop {
-                        // 已取消：放弃当前页的下载与重试
-                        if cancelled_clone.load(Ordering::SeqCst) {
-                            break;
-                        }
+                // Ctrl+C 时立刻丢弃整个下载过程：正在连接/传输中的请求随 future 一起中止，
+                // 不必等它自然超时（最长可挂 60s），否则用户会觉得 Ctrl+C 没生效。
+                // 半截文件在这里统一清理。
+                tokio::select! {
+                    _ = wait_cancelled(&cancelled_clone) => {
+                        let _ = tokio::fs::remove_file(&page_path).await;
+                    }
+                    _ = async {
+                        // 每个页面请求前稍微等待，控制整体下载速率
+                        sleep(Duration::from_millis(300)).await;
 
-                        let mut page = tokio::fs::File::create(&page_path).await.unwrap();
+                        // 单页整体 60s 预算：卡住的请求/重试循环到点放弃该页，
+                        // 删掉不完整的文件，而不是无限等下去
+                        let timed_out = timeout(Duration::from_secs(60), async {
+                            let mut is_err = false;
+                            loop {
+                                //在开始下载前创建相应图片文件
+                                let mut page = tokio::fs::File::create(&page_path).await.unwrap();
 
-                        //发送网络请求
-                        let response = client_clone.get(&page_url_clone).send().await;
+                                //发送网络请求
+                                match client_clone.get(&page_url_clone).send().await {
+                                    Ok(res) if res.status().is_success() => {
+                                        let mut stream = res.bytes_stream();
+                                        while let Some(chunk) = stream.next().await {
+                                            if let Ok(chunk) = chunk {
+                                                page.write_all(&chunk).await.unwrap();
+                                            }
+                                        }
 
-                        match response {
-                            Ok(res) if res.status().is_success() => {
-                                let mut steam = res.bytes_stream();
-                                let mut aborted = false;
-
-                                while let Some(chunk) = steam.next().await {
-                                    // 接收数据期间按了 Ctrl+C：停止接收
-                                    if cancelled_clone.load(Ordering::SeqCst) {
-                                        aborted = true;
+                                        if is_err {
+                                            println!(
+                                                "{}:第{}页下载重试完成，下载成功！",
+                                                chapter_clone.chapter_name,
+                                                index + 1
+                                            );
+                                        }
+                                        pb_clone.inc(1);
                                         break;
                                     }
-                                    if let Ok(chunk) = chunk {
-                                        page.write_all(&chunk).await.unwrap();
+                                    Ok(res) => {
+                                        // 429/503 等限流或错误状态：不写入文件，等待后重试
+                                        if !is_err {
+                                            println!(
+                                                "{}:第{}页下载失败（状态码 {}），正在重试...",
+                                                chapter_clone.chapter_name,
+                                                index + 1,
+                                                res.status()
+                                            );
+                                            is_err = true;
+                                        }
+                                        sleep(Duration::from_secs(2)).await;
+                                    }
+                                    Err(_) => {
+                                        if !is_err {
+                                            println!(
+                                                "{}:第{}页下载失败，正在重试...",
+                                                chapter_clone.chapter_name,
+                                                index + 1
+                                            );
+                                            is_err = true;
+                                        }
+                                        // 失败后等待再重试，避免请求过快
+                                        sleep(Duration::from_secs(2)).await;
                                     }
                                 }
+                            }
+                        })
+                        .await
+                        .is_err();
 
-                                if aborted {
-                                    // 先关闭文件句柄（Windows 上打开中的文件无法删除），
-                                    // 再删掉写了一半的图片，避免留下损坏文件
-                                    drop(page);
-                                    let _ = tokio::fs::remove_file(&page_path).await;
-                                    break;
-                                }
-
-                                if isErr {
-                                    println!(
-                                        "{}:第{}页下载重试完成，下载成功！",
-                                        chapter_clone.chapter_name,
-                                        index + 1
-                                    );
-                                }
-                                pb_clone.inc(1);
-                                break;
-                            }
-                            Ok(res) => {
-                                // 429/503 等限流或错误状态：不写入文件，等待后重试
-                                if !isErr {
-                                    println!(
-                                        "{}:第{}页下载失败（状态码 {}），正在重试...",
-                                        chapter_clone.chapter_name,
-                                        index + 1,
-                                        res.status()
-                                    );
-                                    isErr = true;
-                                }
-                                sleep(Duration::from_secs(2)).await;
-                            }
-                            Err(_) => {
-                                if !isErr {
-                                    println!(
-                                        "{}:第{}页下载失败，正在重试...",
-                                        chapter_clone.chapter_name,
-                                        index + 1
-                                    );
-                                    isErr = true;
-                                }
-                                // 失败后等待再重试，避免请求过快
-                                sleep(Duration::from_secs(2)).await;
-                            }
+                        // 超时：跳过该页并删掉不完整的文件，而不是 panic 退出整个程序
+                        if timed_out {
+                            println!(
+                                "{}:第{}页下载超时(60s)，跳过该页",
+                                chapter_clone.chapter_name,
+                                index + 1
+                            );
+                            let _ = tokio::fs::remove_file(&page_path).await;
                         }
-                    }
-                })
-                .await
-                .is_err();
-
-                // 超时：跳过该页并删掉不完整的文件，而不是 panic 退出整个程序
-                if timed_out {
-                    println!(
-                        "{}:第{}页下载超时(60s)，跳过该页",
-                        chapter_clone.chapter_name,
-                        index + 1
-                    );
-                    let _ = tokio::fs::remove_file(&page_path).await;
+                    } => {}
                 }
             });
 
@@ -368,12 +362,27 @@ pub async fn download(
             }
         }
 
+        // finish_with_message 会把进度条强制填满（indicatif 的行为，pos 被设成 len），
+        // 有页面失败/跳过时会伪装成"全部完成"；abandon 则保留真实进度
+        let succeeded = pb.position() as usize;
+        let total = chapter.len;
         if cancelled.load(Ordering::SeqCst) {
-            pb.finish_with_message(format!("{} 下载已取消", chapter.chapter_name));
+            pb.abandon_with_message(format!(
+                "{} 已取消，成功 {succeeded}/{total}",
+                chapter.chapter_name
+            ));
             return Ok(());
         }
 
-        pb.finish_with_message(format!("{} 下载完毕", chapter.chapter_name));
+        if succeeded == total {
+            pb.finish_with_message(format!("{} 下载完毕", chapter.chapter_name));
+        } else {
+            pb.abandon_with_message(format!(
+                "{} 成功 {succeeded}/{total}，{} 页失败已跳过",
+                chapter.chapter_name,
+                total - succeeded
+            ));
+        }
     }
 
     Ok(())
@@ -401,6 +410,9 @@ pub async fn download_chapters_streaming(
     // 上一话的后台下载任务；开下一话前先等它结束，避免多话并发叠加
     let mut prev: Option<tokio::task::JoinHandle<()>> = None;
     let mut skipped = 0usize;
+    // 下载前准备（如拷贝漫画的链路测速）只做一次：第一话直链到手时执行，
+    // 结果对整个批量下载生效
+    let mut prepared = false;
 
     for (index, chapter) in chapters.iter().enumerate() {
         if cancelled.load(Ordering::SeqCst) {
@@ -429,6 +441,13 @@ pub async fn download_chapters_streaming(
             }
         };
 
+        if !prepared {
+            source
+                .prepare_for_download(pages_url.first().map(String::as_str), &cancelled)
+                .await;
+            prepared = true;
+        }
+
         wait_chapter_download(prev.take()).await;
         println!(
             "({}/{}) {} 拿到 {} 页直链，开始下载",
@@ -437,6 +456,9 @@ pub async fn download_chapters_streaming(
             chapter.chapter_name,
             pages_url.len()
         );
+
+        // 落盘扩展名由源按直链决定（拷贝漫画直链写 .jpg 实际是 webp）
+        let page_ext = source.image_extension(pages_url.first().map(String::as_str));
 
         let details = ChapterDetails {
             name: manga_name.to_string(),
@@ -457,7 +479,7 @@ pub async fn download_chapters_streaming(
         // 下载器自身的报错在任务内打印：硬错误（如建目录失败）后续话也会复现，
         // 逐话提示比整趟中断保留的成果更多
         prev = Some(tokio::spawn(async move {
-            if let Err(e) = download(details, 0, 0, client, cancelled_clone).await {
+            if let Err(e) = download(details, 0, 0, client, cancelled_clone, page_ext).await {
                 eprintln!("[!] {} 下载出错: {e}", title);
             }
         }));
@@ -818,10 +840,81 @@ pub async fn update_selected_mangas(
         &update.path_word,
         source.as_ref(),
         &update.new_chapters,
-        cancelled,
+        cancelled.clone(),
     )
     .await?;
 
-    println!("{} 更新完成", manga_name);
+    // 取消时进度条与提示已交代，不再误报"更新完成"
+    if !cancelled.load(Ordering::SeqCst) {
+        println!("{} 更新完成", manga_name);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ctrl+C（cancelled 置位）后 download 必须立刻中断在途请求并返回，
+    /// 而不是等当前请求自然超时（单页预算最长 60s）才收尾——
+    /// 回归用例：取消后仍卡住会被判定为"Ctrl+C 没生效"。
+    #[tokio::test]
+    async fn download_aborts_promptly_on_cancel() {
+        // 本地慢速服务器：声明很长的响应体，然后极慢地吐字节，模拟卡住的 CDN
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
+                    for _ in 0..100000 {
+                        if stream.write_all(&[0x61]).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                });
+            }
+        });
+
+        let pages: Vec<String> = (0..2).map(|_| format!("http://{addr}/slow.webp")).collect();
+        let details = ChapterDetails {
+            name: "取消测试漫画".to_string(),
+            path_word: String::new(),
+            completed: false,
+            source: "test".to_string(),
+            chapters: vec![ChapterContents {
+                chapter_name: "第01話".to_string(),
+                chapter_uuid: String::new(),
+                len: pages.len(),
+                pages_url: pages,
+            }],
+        };
+
+        let client = Client::builder().build().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        // download 的错误类型 Box<dyn Error> 不是 Send，不能直接当 spawn 的输出，
+        // 包一层只关心成败
+        let task_cancelled = cancelled.clone();
+        let task = tokio::spawn(async move {
+            download(details, 0, 0, client, task_cancelled, "webp").await.is_ok()
+        });
+        // 等页面任务真正发出请求、开始接收数据后再取消
+        sleep(Duration::from_millis(500)).await;
+        cancelled.store(true, Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        assert!(task.await.unwrap(), "下载任务不应报错退出");
+        let elapsed = started.elapsed();
+
+        let _ = tokio::fs::remove_dir_all("./download/取消测试漫画").await;
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "取消后 download 应迅速返回，实际耗时 {elapsed:?}"
+        );
+    }
 }
