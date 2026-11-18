@@ -40,7 +40,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package (Linux / macOS)
         if: runner.os != 'Windows'
@@ -71,6 +71,7 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
           files: |
             ${{ env.ASSET }}

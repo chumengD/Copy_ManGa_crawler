@@ -7,19 +7,19 @@
 //! 2. 调用详情接口拿到 `results` 密文字段
 //! 3. `decrypt_results`：密文前 16 字符作 IV，其余 hex 解码后 AES-128-CBC + PKCS7 解密
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, REFERER};
 use reqwest::Client;
+use reqwest::header::{HeaderMap, REFERER};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use regex::Regex;
 
-use crate::source::MangaSource;
-use crate::types::{ChapterContents, ManGa_item, Response};
+use crate::source::{MangaSource, parse_completion_text, parse_html_completion};
+use crate::types::{ChapterContents, ManGa_item, MangaDetails, Response};
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
@@ -93,7 +93,7 @@ impl CopyMangaSource {
         &self,
         manga_id: &str,
         cancelled: &AtomicBool,
-    ) -> Result<Option<Value>> {
+    ) -> Result<Option<(Value, Option<bool>)>> {
         let page_url = format!("{}/comic/{manga_id}", self.base_website);
 
         let Some(html) = self
@@ -160,7 +160,8 @@ impl CopyMangaSource {
             );
         }
 
-        Ok(Some(payload))
+        let completed = extract_completion(&payload).or_else(|| parse_html_completion(&html));
+        Ok(Some((payload, completed)))
     }
 }
 
@@ -218,11 +219,24 @@ impl MangaSource for CopyMangaSource {
         manga_id: &str,
         cancelled: &AtomicBool,
     ) -> Result<Vec<ChapterContents>> {
-        let Some(payload) = self.fetch_chapter_payload(manga_id, cancelled).await? else {
-            return Ok(Vec::new());
-        };
+        Ok(self.fetch_details(manga_id, cancelled).await?.chapters)
+    }
 
-        Ok(extract_chapter_contents(&payload))
+    async fn fetch_details(&self, manga_id: &str, cancelled: &AtomicBool) -> Result<MangaDetails> {
+        let Some((payload, completed)) = self.fetch_chapter_payload(manga_id, cancelled).await?
+        else {
+            return Ok(MangaDetails::default());
+        };
+        let chapters = extract_chapter_contents(&payload);
+        // 空大纲可能是软限流响应，不能用它覆盖已有话数和章节缓存。
+        if chapters.is_empty() {
+            bail!("网站未返回有效章节大纲，请稍后重试（保留已有缓存）");
+        }
+        Ok(MangaDetails {
+            completed,
+            online_chapter_count: chapters.len(),
+            chapters,
+        })
     }
 
     async fn fetch_pages(
@@ -255,11 +269,7 @@ impl MangaSource for CopyMangaSource {
         let pages_url: Vec<String> =
             serde_json::from_value::<Vec<Value>>(decrypt_results(&content_key, &cct)?)?
                 .into_iter()
-                .filter_map(|page| {
-                    page.get("url")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
+                .filter_map(|page| page.get("url").and_then(Value::as_str).map(str::to_string))
                 .collect();
 
         Ok(pages_url)
@@ -300,7 +310,10 @@ impl MangaSource for CopyMangaSource {
                         .map(|item| item.path_word));
                 }
                 Ok(response) => {
-                    println!("搜索漫画 ID 失败，状态码: {}，正在重试...", response.status());
+                    println!(
+                        "搜索漫画 ID 失败，状态码: {}，正在重试...",
+                        response.status()
+                    );
                 }
                 Err(e) => {
                     println!("搜索漫画 ID 发生错误: {e}，正在重试...");
@@ -365,6 +378,19 @@ fn extract_chapter_secrets(html: &str) -> Result<(String, String)> {
     Ok((cct, content_key))
 }
 
+fn extract_completion(details: &Value) -> Option<bool> {
+    [details.pointer("/comic/status"), details.get("status")]
+        .into_iter()
+        .flatten()
+        .find_map(|status| {
+            status
+                .get("display")
+                .and_then(Value::as_str)
+                .or_else(|| status.as_str())
+                .and_then(parse_completion_text)
+        })
+}
+
 fn extract_chapter_contents(details: &Value) -> Vec<ChapterContents> {
     let mut chapters = Vec::new();
 
@@ -401,6 +427,24 @@ fn extract_chapter_contents(details: &Value) -> Vec<ChapterContents> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reads_completion_from_detail_status() {
+        assert_eq!(
+            extract_completion(&json!({"comic": {"status": {"value": 1, "display": "已完結"}}})),
+            Some(true)
+        );
+        assert_eq!(
+            extract_completion(&json!({"status": {"value": 0, "display": "連載中"}})),
+            Some(false)
+        );
+        assert_eq!(extract_completion(&json!({"status": "完结"})), Some(true));
+        assert_eq!(
+            extract_completion(&json!({"status": {"display": "暂停"}})),
+            None
+        );
+        assert_eq!(extract_completion(&json!({})), None);
+    }
 
     #[test]
     fn extracts_chapter_name_and_uuid() {
