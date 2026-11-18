@@ -11,7 +11,7 @@
 //! `login` 是登录可解锁，`vip` 是站点权限（登录也不解锁），都只提示不抓取。
 //! 登录会话 cookie 持久化在 `download/.zerobyw_cookies.json`，下次启动自动恢复。
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
 use reqwest::cookie::{CookieStore, Jar};
@@ -19,15 +19,15 @@ use reqwest::header::{HeaderMap, REFERER};
 use reqwest::{Client, Url};
 use scraper::{Html, Selector};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{create_dir_all, remove_file, write};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use crate::input_line;
 use crate::input_number;
-use crate::source::MangaSource;
-use crate::types::{ChapterContents, ManGa_item};
+use crate::source::{MangaSource, parse_html_completion};
+use crate::types::{ChapterContents, ManGa_item, MangaDetails};
 
 /// 站点地址直接硬编码。该站域名尾部的数字会不定期变化，失效时改这里
 pub const BASE_WEBSITE: &str = "https://www.zerobyw33.com";
@@ -113,11 +113,13 @@ impl ZerobywSource {
     ///
     /// 站点登录是 Discuz 论坛表单：先 GET 登录页拿到服务端生成的
     /// formhash/loginhash，再原样 POST 回表单 action，缺了会被拒。
-    pub async fn login(&self, username: &str, password: &str, cancelled: &AtomicBool) -> Result<()> {
-        let login_url = format!(
-            "{}/member.php?mod=logging&action=login",
-            self.base_website
-        );
+    pub async fn login(
+        &self,
+        username: &str,
+        password: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        let login_url = format!("{}/member.php?mod=logging&action=login", self.base_website);
         let Some(html) = self
             .get_with_retry(
                 || self.client.get(&login_url),
@@ -138,17 +140,20 @@ impl ZerobywSource {
         let Some(text) = self
             .get_with_retry(
                 || {
-                    self.client.post(&post_url).header(REFERER, &referer).form(&[
-                        ("formhash", formhash.as_str()),
-                        ("referer", referer.as_str()),
-                        ("loginfield", "username"),
-                        ("username", username),
-                        ("password", password),
-                        ("questionid", "0"),
-                        ("answer", ""),
-                        // cookie 有效期 30 天（站点 cookietime 单位为秒）
-                        ("cookietime", "2592000"),
-                    ])
+                    self.client
+                        .post(&post_url)
+                        .header(REFERER, &referer)
+                        .form(&[
+                            ("formhash", formhash.as_str()),
+                            ("referer", referer.as_str()),
+                            ("loginfield", "username"),
+                            ("username", username),
+                            ("password", password),
+                            ("questionid", "0"),
+                            ("answer", ""),
+                            // cookie 有效期 30 天（站点 cookietime 单位为秒）
+                            ("cookietime", "2592000"),
+                        ])
                 },
                 "登录",
                 3,
@@ -184,10 +189,7 @@ impl ZerobywSource {
     /// 当前是否已有有效登录会话：带 cookie 请求登录页，
     /// 还渲染登录表单说明未登录（已登录时站点返回"您已登录"提示页，没有表单）。
     async fn session_valid(&self, cancelled: &AtomicBool) -> Result<bool> {
-        let login_url = format!(
-            "{}/member.php?mod=logging&action=login",
-            self.base_website
-        );
+        let login_url = format!("{}/member.php?mod=logging&action=login", self.base_website);
         let Some(html) = self
             .get_with_retry(
                 || self.client.get(&login_url),
@@ -279,8 +281,7 @@ impl ZerobywSource {
                         return;
                     }
                     println!("登录失败：{e}");
-                    if input_number("1: 重试登录  0: 跳过（仅能下载未上锁章节）\n", cancelled)
-                        .await
+                    if input_number("1: 重试登录  0: 跳过（仅能下载未上锁章节）\n", cancelled).await
                         != Some(1)
                     {
                         return;
@@ -350,11 +351,7 @@ fn extract_kuid(href: &str) -> Option<String> {
     let idx = href.find("kuid=")?;
     let rest = &href[idx + "kuid=".len()..];
     let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if num.is_empty() {
-        None
-    } else {
-        Some(num)
-    }
+    if num.is_empty() { None } else { Some(num) }
 }
 
 /// 解析详情页的章节列表，返回 (可读章节, 需登录数, VIP 数)。
@@ -482,6 +479,10 @@ impl MangaSource for ZerobywSource {
         manga_id: &str,
         cancelled: &AtomicBool,
     ) -> Result<Vec<ChapterContents>> {
+        Ok(self.fetch_details(manga_id, cancelled).await?.chapters)
+    }
+
+    async fn fetch_details(&self, manga_id: &str, cancelled: &AtomicBool) -> Result<MangaDetails> {
         let url = format!("{}/Android/details/?kuid={manga_id}", self.base_website);
         let Some(html) = self
             .get_with_retry(
@@ -493,7 +494,7 @@ impl MangaSource for ZerobywSource {
             )
             .await?
         else {
-            return Ok(Vec::new());
+            return Ok(MangaDetails::default());
         };
 
         let (chapters, login_locked, vip_locked) = parse_chapter_list(&html);
@@ -508,7 +509,17 @@ impl MangaSource for ZerobywSource {
             );
         }
 
-        Ok(chapters)
+        let online_chapter_count = chapters.len() + login_locked + vip_locked;
+        if online_chapter_count == 0 {
+            return Err(anyhow!(
+                "网站未返回有效章节大纲，请稍后重试（保留已有缓存）"
+            ));
+        }
+        Ok(MangaDetails {
+            completed: parse_html_completion(&html),
+            online_chapter_count,
+            chapters,
+        })
     }
 
     async fn fetch_pages(
@@ -641,9 +652,40 @@ mod tests {
         assert_eq!(vip_locked, 1);
     }
 
+    #[tokio::test]
+    async fn details_include_locked_chapters_in_website_total() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"<div class="manga-status">已完结</div><div class="chapter-grid">
+                <a class="chapter-item" href="/Android/view/?zjid=111">第1话</a>
+                <a class="chapter-item" onclick="checkAuth('login')">第2话</a>
+                <a class="chapter-item" onclick="checkAuth('vip')">第3话</a>
+                </div>"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let source = ZerobywSource::with_base_website(&format!("http://{address}")).unwrap();
+        let details = source
+            .fetch_details("1", &AtomicBool::new(false))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(details.completed, Some(true));
+        assert_eq!(details.online_chapter_count, 3);
+        assert_eq!(details.chapters.len(), 1);
+    }
+
     #[test]
     fn extracts_login_message_from_response() {
-        let success = "succeedlocation').innerHTML = '欢迎您回来，新手上路 某用户，现在将转入登录前页面';";
+        let success =
+            "succeedlocation').innerHTML = '欢迎您回来，新手上路 某用户，现在将转入登录前页面';";
         assert!(login_message(success).unwrap().contains("欢迎您回来"));
         assert_eq!(
             login_message(r#"<div class="alert_error">密码错误次数过多</div>"#),

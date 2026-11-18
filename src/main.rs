@@ -1,13 +1,15 @@
+mod source_settings;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use Copy_ManGa_downloader::types::ChapterDetails;
+use Copy_ManGa_downloader::types::{ChapterDetails, chapter_progress, completion_label};
 use Copy_ManGa_downloader::{
-    BASE_WEBSITE, CopyMangaSource, MangaSource, ZerobywSource, check_manga_updates,
+    MangaSource, check_manga_updates,
     display_chapter_list, download_chapters_streaming, fetch_manga_outline, input_line,
     input_number, pause_on_error, read_manga_downloaded, save_chapter_details,
-    set_manga_completed, stdin_at_eof, update_selected_mangas,
+    set_manga_completed, stdin_at_eof, update_selected_mangas, manga_name_matches,
 };
 
 #[tokio::main]
@@ -28,32 +30,14 @@ async fn main(){
        }
    });
 
-    // 启动时选择漫画源：之后所有搜索/下载/更新检查都走选定的适配器
-    let source: Arc<dyn MangaSource> = match input_number("选择漫画源：1:拷贝漫画(默认)  2:zerobyw搬运网\n", &cancelled).await {
-        Some(2) => match ZerobywSource::new() {
-            Ok(s) => Arc::new(s) as Arc<dyn MangaSource>,
-            Err(e) => {
-                eprintln!("\n==============================");
-                eprintln!("程序发生错误，已停止运行：");
-                eprintln!("{}", e);
-                eprintln!("==============================");
-                pause_on_error();
-                return;
-            }
-        },
-        _ => match CopyMangaSource::new(BASE_WEBSITE) {
-            Ok(c) => Arc::new(c) as Arc<dyn MangaSource>,
-            Err(e) => {
-                eprintln!("\n==============================");
-                eprintln!("程序发生错误，已停止运行：");
-                eprintln!("{}", e);
-                eprintln!("==============================");
-                pause_on_error();
-                return;
-            }
-        },
+    let mut source = match source_settings::load_default().create() {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("初始化漫画源失败：{}", e);
+            pause_on_error();
+            return;
+        }
     };
-
     // 选定源后先跑该源自带的引导（如 zerobyw 的登录引导），可跳过
     source.on_selected(&cancelled).await;
 
@@ -62,7 +46,7 @@ async fn main(){
         if cancelled_count.load(Ordering::SeqCst) >=2{
             break 'outer;
         }
-       println!("1:搜索  2:指定漫画检查更新  3:检查全部更新  4:标记完结  5:退出");
+       println!("1:搜索  2:指定漫画检查更新  3:检查全部更新  4:标记完结  5:换源  6:退出");
        let choice =input_number("你想要干什么：", &cancelled).await;
 
 
@@ -116,7 +100,12 @@ async fn main(){
                                     pause_on_error();
                                 }
                             }
-                            5 =>{
+                            5 => {
+                                if let Err(e) = source_settings::switch_source(&mut source, &cancelled).await {
+                                    eprintln!("换源失败：{}", e);
+                                }
+                            }
+                            6 =>{
                                 println!("正在退出程序.....");
                                 break 'outer;
                             }
@@ -151,7 +140,7 @@ async fn mark_manga_completed(cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn 
 
     println!("\n本地漫画:");
     for (index, manga) in local_mangas.iter().enumerate() {
-        let status = if manga.completed { "已完结" } else { "未完结" };
+        let status = completion_label(manga.completed);
         println!("{}.{} [{}]", index, manga.name, status);
     }
     println!(
@@ -167,7 +156,7 @@ async fn mark_manga_completed(cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn 
         return Ok(());
     };
 
-    let new_status = !manga.completed;
+    let new_status = manga.completed != Some(true);
     set_manga_completed(&manga.name, new_status).await?;
     if new_status {
         println!("已将 {} 标记为已完结，检查更新时会跳过", manga.name);
@@ -180,6 +169,10 @@ async fn mark_manga_completed(cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn 
 /// 提示输入起始/结束话数（1-based，闭区间），校验通过后返回 0-based (begin, end)。
 /// 取消/EOF 返回 None。
 async fn input_chapter_range(total: usize, cancelled: &AtomicBool) -> Option<(usize, usize)> {
+    if total == 0 {
+        println!("当前没有可下载的章节");
+        return None;
+    }
     loop {
         let mut begin = input_number("请输入起始话数(包含该话)：", cancelled).await?;
 
@@ -213,28 +206,47 @@ async fn check_selected_manga_update(
         return Ok(());
     }
 
-    println!("\n本地漫画:");
-    for (index, manga) in local_mangas.iter().enumerate() {
-        let status = if manga.completed { "已完结" } else { "未完结" };
+    let mut keyword = String::new();
+    let manga = loop {
+        let matches: Vec<_> = local_mangas
+            .iter()
+            .filter(|manga| manga_name_matches(&manga.name, &keyword))
+            .collect();
         println!(
-            "{}.{} (已下载 {} 话) [{}]",
-            index,
-            manga.name,
-            manga.chapter_names.len(),
-            status
+            "\n本地漫画（匹配 {} 部，网站话数为上次检查的缓存）：",
+            matches.len()
         );
-    }
-    println!(
-        "输入 0-{0} 选择一部漫画，输入 {0} 以外的数字返回",
-        local_mangas.len() - 1
-    );
-
-    let Some(choice) = input_number("请输入要检查更新的漫画序号：", &cancelled).await else {
-        return Ok(());
-    };
-    let Some(manga) = local_mangas.get(choice) else {
-        println!("序号超出范围，返回主菜单...");
-        return Ok(());
+        for (index, manga) in matches.iter().enumerate() {
+            println!(
+                "{}.{} (本地/网站：{}) [{}]",
+                index,
+                manga.name,
+                chapter_progress(manga.chapter_names.len(), manga.online_chapter_count),
+                completion_label(manga.completed)
+            );
+        }
+        if matches.is_empty() {
+            println!("没有匹配的漫画，请换个关键词；输入 / 显示全部");
+        }
+        println!(
+            "输入序号选择；输入关键词模糊搜索；/ 显示全部；q 返回（搜索数字或 q 请加 / 前缀）"
+        );
+        let Some(input) = input_line("序号或关键词：", &cancelled).await else {
+            return Ok(());
+        };
+        if input.eq_ignore_ascii_case("q") {
+            return Ok(());
+        }
+        if let Some(query) = input.strip_prefix('/') {
+            keyword = query.trim().to_string();
+        } else if let Ok(index) = input.parse::<usize>() {
+            if let Some(manga) = matches.get(index) {
+                break *manga;
+            }
+            println!("序号超出范围，请重新选择");
+        } else {
+            keyword = input;
+        }
     };
 
     // 无论有没有新章节，都拉取线上章节列表展示，让用户自选区间下载：
@@ -245,15 +257,29 @@ async fn check_selected_manga_update(
 
     let total = outline.online_chapters.len();
     if total == 0 {
-        println!("{} 线上没有章节", outline.name);
+        println!(
+            "{} 本地/网站：{} [{}]，当前没有可读章节",
+            outline.name,
+            chapter_progress(
+                manga.chapter_names.len(),
+                Some(outline.online_chapter_count)
+            ),
+            completion_label(outline.completed)
+        );
         return Ok(());
     }
 
     let local_chapter_names = manga.chapter_names.iter().collect::<HashSet<_>>();
 
     println!(
-        "\n{} 线上共 {} 话（标 [新] 的表示本地没有）：",
-        outline.name, total
+        "\n{} 本地/网站：{} [{}]，可读 {} 话（标 [新] 的表示本地没有）：",
+        outline.name,
+        chapter_progress(
+            manga.chapter_names.len(),
+            Some(outline.online_chapter_count)
+        ),
+        completion_label(outline.completed),
+        total
     );
     for (index, chapter) in outline.online_chapters.iter().enumerate() {
         let tag = if local_chapter_names.contains(&chapter.chapter_name) {
@@ -283,8 +309,10 @@ async fn check_selected_manga_update(
     Ok(())
 }
 
-async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
-
+async fn run(
+    source: Arc<dyn MangaSource>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 输入关键词期间按了 Ctrl+C（返回 None）或 stdin 关闭都放弃本次搜索
     let Some(key_word) = input_line("输入关键词：\n", &cancelled).await else {
         println!("搜索已取消，未返回结果");
@@ -297,7 +325,8 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
         return Ok(());
     }
 
-    let Some(choice) = input_number("请输入要下载的漫画序号", &cancelled).await else {
+    let Some(choice) = input_number("请输入要下载的漫画序号：", &cancelled).await
+    else {
         return Ok(());
     };
     let Some(selected_manga) = list.get(choice) else {
@@ -305,8 +334,8 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
         return Ok(());
     };
 
-    let chapters = source
-        .fetch_chapters(&selected_manga.path_word, &cancelled)
+    let details = source
+        .fetch_details(&selected_manga.path_word, &cancelled)
         .await?;
     if cancelled.load(Ordering::SeqCst) {
         eprintln!("获取章节详情失败，退出....");
@@ -318,9 +347,11 @@ async fn run(source: Arc<dyn MangaSource>, cancelled: Arc<AtomicBool>) -> Result
     let chapter_details = ChapterDetails {
         name: selected_manga.name.clone(),
         path_word: selected_manga.path_word.clone(),
-        completed: false,
+        completed: details.completed,
+        completed_override: None,
+        online_chapter_count: Some(details.online_chapter_count),
         source: source.id().to_string(),
-        chapters,
+        chapters: details.chapters,
     };
 
     let json_path = save_chapter_details(&chapter_details).await?;
